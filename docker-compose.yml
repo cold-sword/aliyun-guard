@@ -16,6 +16,7 @@ services:
     # 二选一（默认 GHCR，国内机器可换 Docker Hub）
     image: ghcr.io/cold-sword/aliyun-guard:latest
     # image: coldsword/aliyun-guard:latest
+    network_mode: bridge
     container_name: aliyun-guard
     restart: unless-stopped
     environment:
