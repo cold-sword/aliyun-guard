@@ -2,12 +2,12 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.5.0-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.5.9-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
-![Telegram](https://img.shields.io/badge/Notify-Telegram-26a5e4?logo=telegram&logoColor=white)
+![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
 
-Aliyun Guard 是一个面向阿里云 ECS 的网页与终端守护工具。它定时查询账号当月 CDT 公网流量、ECS 状态和当前实例税前账单，在计划运行时段且流量安全时确保实例运行，达到阈值或进入计划关机时段后自动关机，并在每轮检测结束后发送 Telegram 汇总。
+Aliyun Guard 是一个面向阿里云 ECS 的网页、终端与 Telegram 守护工具。它定时查询账号当月 CDT 公网流量、ECS 状态和当前实例税前账单，在计划运行时段且流量安全时确保实例运行，达到阈值或进入计划关机时段后自动关机，并在每轮检测结束后发送 Telegram 汇总。
 
 本项目参考了 [10000ge10000/aliyun_monitor](https://github.com/10000ge10000/aliyun_monitor) 的核心思路，并借鉴 [wang4386/CDT-Monitor](https://github.com/wang4386/CDT-Monitor) 的按实例每日开关机面板设计。项目针对实际部署中遇到的安装兼容、通知缺失、账单 Endpoint 混用、错误来源不清晰和更新困难等问题进行了独立重写。
 
@@ -16,7 +16,7 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页与终端守护工具。它�
 - **CDT 流量止损**：流量达到设定阈值后停止 ECS，防止继续产生公网流量。
 - **自动保活恢复**：流量低于阈值而实例处于 `Stopped` 时自动启动；次月 CDT 重置后可自动恢复。
 - **每日定时开关机**：每个实例可独立设置 `HH:MM` 开机和关机时间，支持跨午夜时段、下一动作预览和服务离线后的补偿执行。
-- **完整网页控制台**：终端管理面板的检测、演练、实例增删改查、Telegram 与节点、全局设置、服务重启和 GitHub 更新均可在网页完成。
+- **完整网页控制台**：终端管理面板的检测、演练、实例增删改查、Telegram 与节点、全局设置、服务重启和 GitHub 更新均可在网页完成；更新过程显示真实阶段进度并自动跨服务重启续接。
 - **可解释流量趋势**：悬停、键盘聚焦或触摸折线检测点，可查看检测时间、当时流量、ECS 状态变化、执行动作和检测结果。
 - **国内站与国际站账单**：分别支持人民币和美元账单 Endpoint，也允许自定义 BSS Endpoint。
 - **错误来源分离**：CDT、ECS、BSS 和 Telegram 分别记录结果；账单失败不会阻断保活判断。
@@ -24,6 +24,7 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页与终端守护工具。它�
 - **Telegram 多连接方式**：支持直连、SOCKS5、HTTP/HTTPS、API 反向代理，以及保存、切换多个 VLESS、VMess、Shadowsocks 单节点链接。
 - **通知标明代理节点**：使用代理时，每条 Bot 通知都会显示脱敏后的代理端点或节点备注。
 - **Telegram 路径延迟测试**：按当前连接方式向 Telegram Bot API 发起 3 次请求，并在终端和测试通知中显示平均往返延迟。
+- **Telegram Bot 单消息控制**：默认启用管理员私聊控制，状态、实例、检测、开关机和定时计划都在同一条 Bot 消息内切换；真实动作均需按钮确认，关机实例开机需要连续两次确认。
 - **多账号、多地域、多实例**：每个实例可使用独立 AccessKey、Region、阈值和账单站点。
 - **单实例独立日志**：可为指定实例单独启用日志，周期检测与网页手动开关机按实例隔离记录。
 - **交互式管理面板**：增删改、暂停/恢复、立即检测、演练、日志、服务管理和 GitHub 更新均可在菜单完成。
@@ -31,6 +32,10 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页与终端守护工具。它�
 - **多调度后端**：优先使用 systemd，其次 OpenRC；无 init 服务时自动回退到 cron。
 - **Docker / Compose**：提供可直接构建的镜像、交互式首次配置、公网 IP 访问、数据卷持久化和容器专用重启/更新提示。
 - **安全更新**：更新前校验 GitHub `install.sh.sha256`，保留配置、状态和日志后重启服务。
+- **加密备份与回滚**：网页和终端均可创建 AES-256-GCM 加密备份、预览恢复差异；每次更新前自动保存程序快照，可一键回滚且不覆盖配置。
+- **S3 自动异地备份**：按小时、每天或每周把 AES-256-GCM 加密备份上传 AWS S3；支持 IAM Role、R2、MinIO、保留清理、Telegram 结果通知和云端恢复。
+- **监控失联看门狗**：独立 systemd timer 或 cron 每分钟检查主服务心跳，连续失联后自动重启并通过 Telegram 通知，恢复后再次通知。
+- **自动发现 ECS**：输入 AccessKey 后跨多个 Region 扫描实例，可按标签键值筛选并批量导入，避免手填 Region 和实例 ID。
 - **启动检查版本**：每次打开管理面板都会读取上游 `version.json`；发现新版时在更新菜单旁显示目标版本。
 - **并发保护**：检测任务带文件锁，避免后台巡检与手动执行重叠。
 - **凭据保护**：Token、AccessKey 不写入日志，配置文件权限固定为 `600`。
@@ -60,7 +65,7 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页与终端守护工具。它�
 - 后台每分钟轻量检查一次计划边界，完整 CDT、ECS、BSS 查询仍按“检测间隔”执行。
 - 服务在计划边界暂时离线时，恢复后会比较当前目标时段并补偿执行，不要求刚好在整分钟在线。
 
-> CDT 返回的是账号级总流量，不是单台 ECS 的独立流量。同一 AccessKey 下配置多台实例时，它们读取到相同流量，但可以设置不同关机阈值。
+> CDT 返回的是账号级总流量，不是单台 ECS 的独立流量。同一 AccessKey 下配置多台实例时，它们读取到相同流量，但可以设置不同关机阈值。同一轮检测中，使用相同 AccessKey ID 和 AccessKey Secret 的实例只会请求一次 CDT API，查询结果或错误会在该账号的实例间复用；不同凭据不会合并。
 
 > BSS 账单查询完全独立。即使出现 `NoPermission`、`InvalidAccessKeyId.NotFound` 或 Endpoint 错误，CDT 与 ECS 查询成功后仍会继续执行保活决策，并把账单错误写入 Telegram 汇总。
 
@@ -79,7 +84,7 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页与终端守护工具。它�
  2) 立即执行一轮检测
  3) 演练一轮（不执行开关机）
  4) 测试 Telegram 通知
- 5) Telegram 连接方式
+ 5) Telegram 连接与 Bot 控制
  6) 查看监控实例
  7) 添加监控实例
  8) 编辑监控实例
@@ -90,13 +95,43 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页与终端守护工具。它�
 13) 修改全局设置
 14) 查看最近日志
 15) 重启后台服务
-16) 更新 GitHub 版本  [有新版本 v1.5.0]  # 仅发现更新时显示提示
-17) 退出
+16) 更新 GitHub 版本  [有新版本 v1.5.4]  # 仅发现更新时显示提示
+17) 备份、恢复与版本回滚
+18) 自动发现并批量导入 ECS
+19) 退出
+20) AWS S3 自动备份
 ```
 
-面板标题始终显示当前版本号，例如 `阿里云保活与通知 v1.5.0 - 管理面板`。发现更新时，标题下方和第 16 项会显示黄色的新版本提示；启动检查超时或 GitHub 暂时不可用不会阻塞其他管理操作，也不会自动安装更新。设置 `NO_COLOR=1` 或将输出重定向到文件时，提示会自动退回纯文本。
+面板标题始终显示当前版本号，例如 `阿里云保活与通知 v1.5.4 - 管理面板`。发现更新时，标题下方和第 16 项会显示黄色的新版本提示；启动检查超时或 GitHub 暂时不可用不会阻塞其他管理操作，也不会自动安装更新。设置 `NO_COLOR=1` 或将输出重定向到文件时，提示会自动退回纯文本。
 
-这里的交互操作位于服务器终端。当前版本的 Telegram Bot 只发送通知，不读取 `/status`、`/start`、`/stop` 等远程控制命令。
+## Telegram Bot 控制
+
+Bot 控制默认开启，仅接受授权管理员与机器人的私聊。未单独配置管理员名单时，正数的私聊 `chat_id` 会自动作为管理员用户 ID；群组 `chat_id` 为负数，必须在终端第 5 项或网页 Telegram 页面填写管理员用户 ID。支持多个管理员，使用逗号分隔。
+
+| 命令 | 功能 |
+|---|---|
+| `/start`、`/help` | 显示按钮控制菜单 |
+| `/status` | 查看最近检测时间、结果和检测次数 |
+| `/instances` | 查看实例状态、流量、阈值和暂停状态 |
+| `/check` | 立即执行一轮真实检测，确认后可能按规则开关机 |
+| `/poweron <序号或实例ID>` | 请求单机开机 |
+| `/poweroff <序号或实例ID>` | 请求单机关机 |
+| `/schedule [序号或实例ID]` | 查看和管理实例的每日开关机计划 |
+
+发送 `/start` 后会创建一条控制面板消息。点击状态、实例、检测、开关机或定时计划时，Bot 会编辑这条原消息的文字和按钮，不再为每次点击发送新消息；各页面均提供刷新、返回实例列表或返回主菜单按钮。手动输入新的命令时会创建新的 Bot 回复，之后该回复继续作为当前单消息面板。
+
+“定时计划”可按实例查看服务器时间、启用状态、每日开关机时间、当前计划目标和下一动作。修改时间时发送两个 `HH:MM` 值，例如 `08:30 23:15`；输入 5 分钟后失效。启用或关闭计划需要按钮确认，修改时间不会擅自改变原有启用状态。
+
+安全规则：
+
+- `/check` 和关机操作需要一次按钮确认；确认按钮 90 秒后失效，且只能由发起该操作的管理员使用。
+- 实例当前为 `Stopped` 时，开机必须连续确认两次。第二次确认前会重新读取 ECS 状态和 CDT 流量。
+- 流量达到阈值时，第二次确认会明确显示当前流量；继续强制开机会自动暂停该实例监控，避免下一轮立刻再次关机。
+- 若第二次确认前流量从安全值升至阈值，开机会被拒绝，必须重新发起并确认阈值覆盖。
+- 计划关机时段和现有安全限制仍然生效；未经授权的用户及群组命令不会执行。
+- 服务首次启用、重新启用或更换 Token 时会丢弃此前积压的更新，避免历史命令在恢复后执行。
+
+Bot 使用 Telegram `getUpdates` 长轮询，同一个 Token 不应再由其他控制程序或 Webhook 同时消费。
 
 ## 网页控制面板
 
@@ -107,7 +142,7 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页与终端守护工具。它�
 网页面板包含五个独立视图：
 
 - **实例**：查看 CDT 趋势、ECS、BSS 账单、每日计划和下一动作；每张实例卡右上角都有独立单机设置入口，集中执行开关机、计划、暂停恢复、编辑、校验、查看独立日志和删除。
-- **Telegram**：修改 Bot Token、Chat ID、超时和重试；测试当前通知；配置直连、SOCKS5、HTTP/HTTPS、节点链接或 API 反代；添加、测试、选用和删除多个节点。
+- **Telegram**：修改 Bot Token、Chat ID、Bot 控制开关和管理员名单；测试当前通知；配置直连、SOCKS5、HTTP/HTTPS、节点链接或 API 反代；添加、测试、选用和删除多个节点。
 - **日志**：在系统总日志与各实例独立日志之间切换，可直接启用或停用所选实例日志。
 - **设置**：修改全部检测参数、通知模式、IPv4 策略、网页用户名、密码、监听地址和端口。
 - **系统**：查看调度后端、本机 IP、访问地址和版本，重启后台服务，并检查或安装 GitHub 新版本。
@@ -253,7 +288,7 @@ ag
 
 首次配置向导随后会：
 
-1. 配置 Telegram、通知模式和检测间隔。
+1. 配置 Telegram、默认开启的 Bot 控制、通知模式和检测间隔。
 2. 添加一个或多个阿里云账号/实例，并按需设置每日开关机计划。
 3. 只读校验 AccessKey、CDT、ECS、BSS、Region 和实例 ID。
 4. 按需启用网页登录控制台并设置独立登录密码。
@@ -403,9 +438,115 @@ aliyun-guard uninstall       # 交互式卸载
 
 交互式面板的 `14) 查看最近日志` 可选择系统总日志或某一实例；`aliyun-guard logs` 与 `aliyun-guard logs-follow` 仍用于主日志。
 
+## 加密备份、恢复与版本回滚
+
+终端执行 `aliyun-guard` 后选择 `17) 备份、恢复与版本回滚`，可以：
+
+1. 创建包含 `config.json`、运行状态和可选日志的 `.agbackup` 加密备份。
+2. 输入备份密码后先预览文件差异，不写入本机数据。
+3. 确认差异后恢复；写入前会自动创建一份“恢复前安全备份”。
+4. 回滚到 GitHub 更新前的程序快照；程序回滚不会覆盖 `config.json`、`state.json` 或日志。
+
+网页“系统”页提供相同的备份、恢复预览和程序回滚入口。网页创建备份后会下载到浏览器，同时在服务器的 `backups/` 目录保留一份；恢复文件最大 88 MiB，普通 API 请求仍限制为 1 MiB。
+
+手动数据备份使用 AES-256-GCM 加密，密钥由备份密码通过 PBKDF2-HMAC-SHA256 派生。手动备份密码不会保存，密码遗失后无法恢复。备份可能包含 AccessKey、Bot Token 和代理节点，应离线保管且不要上传到公开仓库。S3 无人值守备份的密码保存方式见后文专节。
+
+每次执行 GitHub 更新前都会自动创建程序快照：
+
+```text
+/opt/aliyun-guard/backups/program-时间-版本.tar.gz
+```
+
+快照恢复前会校验允许的文件清单、路径和大小，并再次保存当前程序快照，便于撤销误回滚。
+
+## AWS S3 自动备份
+
+终端执行 `aliyun-guard` 后选择 `20) AWS S3 自动备份`，或进入网页“系统”页的“AWS S3 自动备份”面板。支持：
+
+- AWS S3、Cloudflare R2、MinIO 和其他兼容 AWS Signature V4 的 S3 服务。
+- 每小时、每天指定时间或每周指定日期和时间自动执行。
+- 自动保留最近 1 至 365 份，上传成功后清理同一对象前缀下的旧 `.agbackup`。
+- 包含或排除运行状态、日志；`config.json` 始终包含在备份中。
+- SSE-S3、SSE-KMS 或关闭服务端加密。无论是否启用服务端加密，上传前都会先完成 AES-256-GCM 客户端加密。
+- Telegram 仅失败通知、成功和失败都通知，或完全不通知。
+- 测试连接、立即备份、查看云端列表、差异预览以及确认恢复。
+
+默认建议为：每天 `03:00`、保留 30 份、包含运行状态、不包含日志、仅失败 Telegram 通知、启用 SSE-S3。自动 S3 上传与 ECS 保活独立，S3 失败只记录日志和通知，不会改变 ECS 本轮开关机决策。
+
+### AWS 认证
+
+运行在 AWS EC2 时优先给实例绑定 IAM Role，并在配置中选择“使用 EC2 IAM Role 或环境凭据”，无需把 AWS 密钥写入 `config.json`。非 EC2 服务器、R2 或 MinIO 可以填写专用的 Access Key；临时凭据还可填写 Session Token。网页不会回传已保存的 Secret、Session Token、备份密码或 KMS Key。
+
+最小 S3 IAM 权限示例：
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:ListBucket"],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": ["aliyun-guard/*"]
+        }
+      }
+    },
+    {
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject", "s3:DeleteObject"],
+      "Resource": "arn:aws:s3:::YOUR_BUCKET/aliyun-guard/*"
+    }
+  ]
+}
+```
+
+使用 SSE-KMS 时还需按 Key Policy 和实际操作补充 `kms:Encrypt`、`kms:Decrypt` 与 `kms:GenerateDataKey`。建议同时在 S3 Bucket 上启用版本控制、阻止公开访问和生命周期策略。
+
+### 加密密码与恢复
+
+自动任务必须无人值守创建和恢复备份，因此 S3 自动备份密码会保存在权限为 `600` 的 `config.json` 中；S3 对象内只有 AES-256-GCM 密文。请限制 root、备份和 SSH 权限，并另外离线保存该密码。密码遗失后无法解密云端备份。
+
+从云端恢复必须先下载并通过密码、AES-GCM 和内部 SHA-256 校验，再显示文件差异；只有预览同一对象后才能确认恢复。恢复写入前仍会创建本地安全备份，完成后自动重启服务。
+
+R2 或 MinIO 配置时填写其 HTTPS Endpoint。MinIO 常用“路径寻址”；AWS 与 R2 通常保持“自动”。
+
+## 监控失联告警
+
+原生安装会创建独立于主服务的心跳检查器：systemd 使用 `aliyun-guard-watchdog.timer`，OpenRC 和 cron 环境使用每分钟 cron。主程序持续更新 `heartbeat.json`；超过设置的超时时间并达到连续失败次数后，看门狗会尝试重启 systemd/OpenRC 服务，发送 Telegram 失联通知，并在心跳恢复后发送恢复通知。
+
+终端管理面板 `13) 修改全局设置` 或网页“设置”页可以配置：
+
+- 是否启用失联看门狗。
+- 心跳超时时间，范围 120 至 86400 秒，默认 600 秒。
+- 连续失败阈值，范围 1 至 10 次，默认 2 次。
+
+执行 `aliyun-guard stop` 会同步写入主动暂停标记、停止主服务并关闭看门狗调度，因此维护期间不会误报或把服务自动拉起；`aliyun-guard start` 和 `restart` 会恢复主服务与看门狗。尚未添加有效实例时，看门狗也不会累计失败或发送通知。
+
+常用诊断命令：
+
+```sh
+systemctl status aliyun-guard-watchdog.timer --no-pager
+journalctl -u aliyun-guard-watchdog.service -n 100 --no-pager
+tail -n 100 /opt/aliyun-guard/logs/watchdog.log  # OpenRC/cron
+cat /opt/aliyun-guard/heartbeat.json
+cat /opt/aliyun-guard/watchdog-state.json
+```
+
+Docker 部署继续由 Compose 的 `restart: unless-stopped` 负责进程退出后的自动拉起；原生安装的独立 systemd/OpenRC 看门狗不在容器内运行。
+
+## 自动发现并导入 ECS
+
+终端执行 `aliyun-guard` 后选择 `18) 自动发现并批量导入 ECS`，或在网页“实例”页点击“自动发现”。输入一组 AccessKey 后，程序会先调用 `DescribeRegions` 获取账号可用 Region，再跨 Region 分页调用 `DescribeInstances`。也可以手动指定 Region，或填写标签键和值缩小扫描范围。
+
+扫描结果会显示 Region、实例 ID、名称、状态和公网 IP；选择一台或多台后可统一设置 CDT 阈值、自动开关机权限和账单站点并批量导入。已经由同一 AccessKey、Region 和实例 ID 配置的项目会自动跳过。某个 Region 无权限或请求失败时会单独列出错误，其他 Region 继续扫描；网页响应和日志不会返回 AccessKey Secret。
+
+自动发现只读取 ECS 元数据，不会启动、停止或修改实例。所用 RAM 身份至少需要 `ecs:DescribeRegions` 和 `ecs:DescribeInstances` 权限；后续保活仍需 README“阿里云 RAM 权限”一节列出的 CDT、ECS 和 BSS 权限。
+
 ## 单实例独立日志
 
-添加或编辑监控实例时，可选择“为该实例启用独立日志”。该开关默认关闭，也可以在网页实例编辑框或“日志”页随时启停。每轮周期检测以及网页手动开机、关机都会追加一条该实例的结果摘要；停用后不再追加，但已有历史日志仍可查看。
+添加或编辑监控实例时，可选择“为该实例启用独立日志”。该开关默认关闭，也可以在网页实例编辑框或“日志”页随时启停。每轮周期检测以及网页或 Telegram Bot 手动开机、关机都会追加一条该实例的结果摘要；停用后不再追加，但已有历史日志仍可查看。
 
 每条记录包含流量与阈值、ECS 检测前后状态、账单结果、动作、是否实际执行、最终说明和错误来源。AccessKey、AccessKey Secret、Bot Token、代理地址和节点链接会被隐藏，不写入独立日志。
 
@@ -447,7 +588,7 @@ aliyun-guard uninstall       # 交互式卸载
 
 ### Telegram 连接方式
 
-主面板第 4 项只测试当前 Telegram 配置，第 5 项独立进入以下连接方式菜单：
+主面板第 4 项只测试当前 Telegram 配置，第 5 项进入连接方式与 Bot 控制菜单：
 
 菜单标题下会直接显示当前方式；使用节点链接时还会显示节点协议和备注，例如：
 
@@ -499,13 +640,13 @@ aliyun-guard uninstall       # 交互式卸载
 aliyun-guard update
 ```
 
-更新确认页面会同时显示当前版本和 GitHub 最新版本；例如从 `v1.4.2` 更新时会显示 `最新版本: v1.5.0`，确认提示中也会带上目标版本号。如果构建指纹一致，则显示 `当前版本已经是最新版本了。` 并直接返回，不重复下载安装。网页“系统”页使用同一更新检查和 SHA-256 校验流程。
+更新确认页面会同时显示当前版本和 GitHub 最新版本；例如从 `v1.5.3` 更新时会显示 `最新版本: v1.5.4`，确认提示中也会带上目标版本号。如果构建指纹一致，则显示 `当前版本已经是最新版本了。` 并直接返回，不重复下载安装。网页“系统”页使用同一更新检查和 SHA-256 校验流程，并显示下载、校验、写入、恢复配置、重启和验证阶段的实际进度。
 
 更新流程：
 
-1. 每次打开面板时下载小型 `version.json`，用版本号与构建指纹判断是否有新版本。
-2. 用户确认更新后，从本仓库 `main` 分支下载 `install.sh`。
-3. 下载 `install.sh.sha256` 并校验文件完整性。
+1. 每次打开面板时从 GitHub Latest Release 下载小型 `version.json`，用版本号与构建指纹判断是否有新版本。
+2. 用户确认更新后，从对应 `vX.Y.Z` Release 下载固定版本的 `install.sh`。
+3. 从同一个 Release 下载 `install.sh.sha256` 并校验文件完整性，避免分支文件缓存错配。
 4. 校验失败立即退出，不覆盖当前程序。
 5. 保留 `config.json`、`state.json` 和日志。
 6. 更新代码与依赖，然后自动重启后台服务。
@@ -553,11 +694,20 @@ aliyun-guard update
 ├── web_panel.py         # 网页认证、API、控制与服务生命周期
 ├── web_panel.html       # 自包含响应式网页界面
 ├── telegram_proxy.py    # Telegram 代理、节点解析和 sing-box 管理
+├── telegram_control.py  # Telegram 命令轮询、授权与二次确认
+├── backup_manager.py    # 加密数据备份与程序快照回滚
+├── s3_backup.py         # S3 协议、自动上传、保留清理与云端恢复
+├── watchdog.py          # 独立心跳检查、重启与失联通知
 ├── control.sh           # aliyun-guard 命令入口
 ├── bin/sing-box         # 仅在使用节点链接时安装
 ├── config.json          # 配置文件，权限 600
 ├── state.json           # 最近检测状态，权限 600
+├── telegram-control-state.json # Bot 更新偏移，权限 600
+├── heartbeat.json       # 主服务最新心跳，权限 600
+├── watchdog-state.json  # 连续失败与通知状态，权限 600
+├── s3-backup-state.json # 最近 S3 尝试、成功与错误状态，权限 600
 ├── service_backend      # 当前调度后端
+├── backups/             # 加密备份与更新前程序快照
 ├── logs/guard.log       # 主日志
 ├── logs/instances/      # 选择性启用的单实例独立日志
 ├── logs/web.log         # cron 回退环境的网页进程日志
@@ -568,6 +718,7 @@ aliyun-guard update
 
 ```sh
 systemctl status aliyun-guard.service   # systemd
+systemctl status aliyun-guard-watchdog.timer # systemd 看门狗
 rc-service aliyun-guard status          # OpenRC
 crontab -l | grep aliyun-guard          # cron 回退
 ```
@@ -588,14 +739,24 @@ aliyun-guard dry-run
 | `InvalidAccessKeyId.NotFound` | AccessKey 已删除，或 BSS 国内/国际站点选错 | 重新创建 AccessKey，并检查账单站点 |
 | `NoPermission` | RAM 权限不足 | 补充 ECS、CDT 或 BSS 只读/操作权限 |
 | `chat not found` | Chat ID 错误，或尚未与 Bot 建立会话 | 向 Bot 发送 `/start` 并重新测试 |
+| `Conflict: terminated by other getUpdates request` | 同一 Token 被其他 Bot 程序同时轮询 | 停止旧控制 Bot，确保只有 Aliyun Guard 使用 `getUpdates` |
+| Bot 回复“无权限” | 当前 Telegram 用户 ID 不在管理员名单 | 在网页 Telegram 页面或终端第 5 项填写自己的用户 ID |
 | `v1.3.1` 及更早版本输入正确密码后仍提示“请先登录” | HTTP 与 Secure Cookie 配置冲突 | 更新到 `v1.3.2`，HTTP/HTTPS 会话会自动分离并同时可用 |
 | `reset by peer` / TLS 超时 | Telegram 或出口网络临时异常 | 保持 IPv4 优先，检查代理/防火墙；程序会自动重试 |
 | `SOCKSHTTPSConnectionPool` / 代理连接失败 | SOCKS5 或 HTTP 代理地址不可达 | 检查代理监听地址、端口、账号和密码 |
 | `sing-box 节点配置校验失败` | 节点链接参数不完整或传输类型不支持 | 重新复制完整单节点链接，或改用本机 SOCKS5 |
+| `AccessDenied` / `403`（S3） | IAM Role/密钥权限不足，或 Bucket/前缀不匹配 | 检查 `ListBucket`、`PutObject`、`GetObject`、`DeleteObject` 与前缀策略 |
+| `NoCredentialsError`（S3） | 未绑定 EC2 IAM Role，也未保存 S3 密钥 | 绑定实例角色，或填写专用 S3 Access Key |
+| S3 Endpoint 连接失败 | R2/MinIO Endpoint、Region、证书或寻址方式错误 | 测试连接，MinIO 尝试改为路径寻址 |
 | `未安装 sing-box` | 节点模式所需核心被删除或安装失败 | 进入 Telegram 配置，第 4 项重新输入节点并选择第 8 项测试安装 |
 | `未找到实例` | Region 或 Instance ID 不匹配 | 在 ECS 控制台核对 Region ID 和实例 ID |
+| `v1.5.1` 网页提示已启动更新但版本未变化 | 旧网页更新进程随 systemd 主服务停止而被终止 | 先通过 SSH 执行一次 `aliyun-guard update` 升级到 `v1.5.2`；后续网页更新会使用独立 systemd 单元 |
+| `v1.5.2` / `v1.5.3` 网页更新校验失败或无完成反馈 | `main` 分支 Raw 文件可能存在缓存错配，旧页面也不显示后台进度 | 使用 `v1.5.4` Release 安装器升级一次；之后更新固定使用同一 Release，并显示真实进度 |
+| `v1.5.4` / `v1.5.5` 网页更新停在 25% | systemd 更新任务没有控制终端，旧安装器误判 `/dev/tty` 可用后提前退出 | `v1.5.6` 发布后在网页直接重试；若仍失败，再通过 SSH 执行 `aliyun-guard update` |
 
 日志会明确使用 `CDT 流量查询失败`、`ECS 实例查询失败`、`BSS 账单查询失败` 或 `Telegram ... 失败` 标注来源，避免一条模糊错误掩盖其他已成功的检查。
+
+网页更新日志位于 `/opt/aliyun-guard/logs/web-update.log`，可执行 `tail -n 100 /opt/aliyun-guard/logs/web-update.log` 查看下载、校验和安装结果。
 
 ## 卸载
 
@@ -612,6 +773,9 @@ aliyun-guard uninstall
 ```text
 src/                         运行源码
 src/telegram_proxy.py        节点解析与 sing-box 生命周期
+src/telegram_control.py      Telegram Bot 单消息导航、计划、授权与确认
+src/backup_manager.py        AES-256-GCM 数据备份与程序快照
+src/s3_backup.py             AWS S3 与兼容存储自动备份
 src/web_actions.py           网页管理动作与脱敏 API 载荷
 src/web_panel.py             网页认证、API 与进程管理
 src/web_panel.html           响应式网页控制台
@@ -623,8 +787,10 @@ Dockerfile                    Docker 镜像定义
 docker-compose.yml            数据持久化与本机端口映射
 requirements.txt              Docker Python 依赖
 tests/test_guard.py           行为测试
+tests/test_telegram_control.py Telegram Bot 单消息、计划与确认流程测试
 tests/test_web_panel.py       网页认证与 API 测试
 tests/test_web_actions.py     网页配置、校验与凭据防泄漏测试
+tests/test_s3_backup.py       S3 调度、上传、保留、脱敏与配置测试
 install.sh                    构建后的单文件安装器
 install.sh.sha256             安装器校验文件
 version.json                  当前版本号与构建指纹
@@ -650,9 +816,9 @@ python3 packaging/build_installer.py ./install.sh
 | 安装兼容 | 主要针对 Debian/RHEL，并包含 Alpine/VNC 扩展 | 支持六类包管理器和三种调度后端 |
 | 通知方式 | 异常通知与定时日报 | 默认每轮合并通知，可切换通知模式 |
 | 账单错误 | 可能与其他查询混在同一错误中 | BSS 独立显示，失败不阻断保活 |
-| 日常管理 | 重跑安装器，另有可选 Telegram 控制 Bot | 网页控制台、终端面板和统一 `aliyun-guard` 命令 |
+| 日常管理 | 重跑安装器，另有可选 Telegram 控制 Bot | 网页、终端、Telegram Bot 和统一 `aliyun-guard` 命令 |
 | 更新方式 | 重跑安装器下载运行文件 | 菜单自更新，并执行 SHA-256 校验 |
-| Telegram 控制 | 可选远程开关机控制 | 当前版本仅发送通知，不接收控制命令 |
+| Telegram 控制 | 可选远程开关机控制 | 默认启用管理员私聊，危险操作确认并记录来源 |
 
 ## 安全提醒
 
@@ -660,6 +826,7 @@ python3 packaging/build_installer.py ./install.sh
 - 一旦凭据出现在聊天、终端录屏或公开日志中，应立即在 BotFather 和阿里云 RAM 控制台撤销并重新创建。
 - 使用 RAM 子账号和最小必要权限，不要使用主账号 AccessKey。
 - 配置文件虽然限制为 root 可读，仍应配合服务器磁盘、备份和 SSH 权限管理。
+- Bot 管理员应使用个人 Telegram 用户 ID，不要把控制权限授予群组或不可信账号。
 - 本工具不能替代阿里云费用中心的预算告警和消费限额。
 
 ## 免责声明

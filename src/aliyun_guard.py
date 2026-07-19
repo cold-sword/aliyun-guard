@@ -27,6 +27,7 @@ except ImportError as exc:
     REQUESTS_IMPORT_ERROR = exc
 
 import telegram_proxy
+import s3_backup
 
 try:
     import fcntl
@@ -53,6 +54,9 @@ APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().pare
 CONFIG_FILE = Path(os.environ.get("ALIYUN_GUARD_CONFIG", APP_DIR / "config.json"))
 STATE_FILE = Path(os.environ.get("ALIYUN_GUARD_STATE", APP_DIR / "state.json"))
 LOCK_FILE = Path(os.environ.get("ALIYUN_GUARD_LOCK", APP_DIR / "cycle.lock"))
+HEARTBEAT_FILE = Path(
+    os.environ.get("ALIYUN_GUARD_HEARTBEAT", APP_DIR / "heartbeat.json")
+)
 LOG_DIR = Path(os.environ.get("ALIYUN_GUARD_LOG_DIR", APP_DIR / "logs"))
 LOG_FILE = LOG_DIR / "guard.log"
 
@@ -80,10 +84,18 @@ DEFAULT_CONFIG = {
         "node_url": "",
         "node_urls": [],
         "api_base_url": "https://api.telegram.org",
+        "control_enabled": True,
+        "control_admin_ids": [],
     },
     "start_wait_seconds": 90,
     "stop_wait_seconds": 45,
     "start_poll_seconds": 5,
+    "watchdog": {
+        "enabled": True,
+        "timeout_seconds": 600,
+        "failure_threshold": 2,
+    },
+    "s3_backup": dict(s3_backup.DEFAULT_CONFIG),
     "users": [],
 }
 
@@ -161,6 +173,45 @@ def telegram_node_urls(telegram):
     return nodes
 
 
+def normalize_telegram_control_admin_ids(value):
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        values = [item for item in re.split(r"[\s,;]+", value.strip()) if item]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        raise GuardError("Telegram Bot 管理员用户 ID 必须是数组或分隔文本")
+    if len(values) > 20:
+        raise GuardError("Telegram Bot 管理员用户 ID 最多配置 20 个")
+    result = []
+    for raw in values:
+        if isinstance(raw, bool):
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        try:
+            user_id = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        if user_id <= 0:
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        if user_id not in result:
+            result.append(user_id)
+    return result
+
+
+def telegram_control_admin_ids(telegram):
+    configured = normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", []) if isinstance(telegram, dict) else []
+    )
+    if configured:
+        return configured
+    try:
+        chat_id = int(str(telegram.get("chat_id", "") or "").strip())
+    except (TypeError, ValueError):
+        return []
+    return [chat_id] if chat_id > 0 else []
+
+
 def load_json(path, default):
     if not path.exists():
         return json.loads(json.dumps(default))
@@ -205,6 +256,20 @@ def save_state(state):
     atomic_write_json(STATE_FILE, state)
 
 
+def write_heartbeat(status="running", detail=None, now=None):
+    now = now or dt.datetime.now().astimezone()
+    value = {
+        "at": now.isoformat(timespec="seconds"),
+        "epoch": now.timestamp(),
+        "status": str(status or "running"),
+        "pid": os.getpid(),
+    }
+    if detail:
+        value["detail"] = str(detail)[:500]
+    atomic_write_json(HEARTBEAT_FILE, value)
+    return value
+
+
 def validate_config(config):
     try:
         interval = int(config.get("interval_seconds", 0))
@@ -222,6 +287,26 @@ def validate_config(config):
     mode = config.get("notification_mode")
     if mode not in ("always", "events", "errors"):
         raise GuardError("notification_mode 必须是 always、events 或 errors")
+    watchdog = config.get("watchdog", {})
+    if not isinstance(watchdog, dict):
+        raise GuardError("watchdog 必须是对象")
+    if "enabled" in watchdog and not isinstance(watchdog.get("enabled"), bool):
+        raise GuardError("watchdog.enabled 必须是布尔值")
+    try:
+        watchdog_timeout = int(watchdog.get("timeout_seconds", 600))
+        watchdog_failures = int(watchdog.get("failure_threshold", 2))
+    except (TypeError, ValueError):
+        raise GuardError("看门狗超时和连续失败次数必须是整数")
+    if watchdog_timeout < 120 or watchdog_timeout > 86400:
+        raise GuardError("看门狗超时必须在 120 到 86400 秒之间")
+    if watchdog_failures < 1 or watchdog_failures > 10:
+        raise GuardError("看门狗连续失败次数必须在 1 到 10 之间")
+    try:
+        config["s3_backup"] = s3_backup.validate_config(
+            config.get("s3_backup", {}), require_ready=None
+        )
+    except s3_backup.S3BackupError as exc:
+        raise GuardError(str(exc))
     try:
         import web_panel
     except ImportError as exc:
@@ -286,6 +371,11 @@ def validate_telegram_config(telegram):
         raise GuardError("Telegram 请求超时必须在 3 到 60 秒之间")
     if retries < 1 or retries > 5:
         raise GuardError("Telegram 重试次数必须在 1 到 5 之间")
+    if "control_enabled" in telegram and not isinstance(
+        telegram.get("control_enabled"), bool
+    ):
+        raise GuardError("Telegram Bot 控制开关必须是布尔值")
+    normalize_telegram_control_admin_ids(telegram.get("control_admin_ids", []))
     mode = str(telegram.get("connection_mode", "direct") or "direct").strip().lower()
     if mode not in ("direct", "socks5", "http", "node", "api_proxy"):
         raise GuardError("Telegram 连接方式无效")
@@ -689,6 +779,33 @@ def query_cdt_traffic_gb(user):
     return total_bytes / (1024.0 ** 3)
 
 
+def cdt_account_cache_key(user):
+    """Return an in-memory fingerprint for one configured credential pair."""
+    credentials = "{}\0{}".format(
+        str(user.get("ak", "") or "").strip(),
+        str(user.get("sk", "") or "").strip(),
+    )
+    return hashlib.sha256(credentials.encode("utf-8")).digest()
+
+
+def query_cdt_traffic_gb_for_cycle(user, cycle_cache=None):
+    """Reuse one account-level CDT result within a single monitoring cycle."""
+    if cycle_cache is None:
+        return query_cdt_traffic_gb(user)
+
+    cache_key = cdt_account_cache_key(user)
+    if cache_key not in cycle_cache:
+        try:
+            cycle_cache[cache_key] = (query_cdt_traffic_gb(user), None)
+        except Exception as exc:
+            cycle_cache[cache_key] = (None, exc)
+
+    traffic_gb, error = cycle_cache[cache_key]
+    if error is not None:
+        raise error
+    return traffic_gb
+
+
 def query_instance_status(user):
     require_sdk()
     request = DescribeInstancesRequest()
@@ -703,6 +820,127 @@ def query_instance_status(user):
     if not instances:
         raise GuardError("区域 {} 中未找到实例 {}".format(user["region"], user["instance_id"]))
     return str(instances[0].get("Status", "Unknown"))
+
+
+def _instance_tags(instance):
+    raw = instance.get("Tags", {}).get("Tag", []) if isinstance(instance, dict) else []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raw = []
+    return {
+        str(item.get("TagKey", "")): str(item.get("TagValue", ""))
+        for item in raw
+        if isinstance(item, dict) and str(item.get("TagKey", ""))
+    }
+
+
+def discover_ecs_regions(ak, sk):
+    require_sdk()
+    access_key = str(ak or "").strip()
+    secret_key = str(sk or "").strip()
+    if not access_key or not secret_key:
+        raise GuardError("AccessKey ID 和 AccessKey Secret 不能为空")
+    request = CommonRequest()
+    request.set_protocol_type("https")
+    request.set_accept_format("json")
+    request.set_method("POST")
+    request.set_domain("ecs.aliyuncs.com")
+    request.set_version("2014-05-26")
+    request.set_action_name("DescribeRegions")
+    request.set_connect_timeout(5000)
+    request.set_read_timeout(15000)
+    credentials = {"ak": access_key, "sk": secret_key}
+    response = make_client(credentials, "cn-hangzhou").do_action_with_exception(request)
+    data = json.loads(response.decode("utf-8"))
+    regions = data.get("Regions", {}).get("Region", [])
+    if isinstance(regions, dict):
+        regions = [regions]
+    if not isinstance(regions, list):
+        raise GuardError("ECS 返回 Region 列表格式无法识别")
+    result = []
+    for item in regions:
+        region = str(item.get("RegionId", "") if isinstance(item, dict) else "").strip()
+        if region and region not in result:
+            result.append(region)
+    return result
+
+
+def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
+    require_sdk()
+    access_key = str(ak or "").strip()
+    secret_key = str(sk or "").strip()
+    if not access_key or not secret_key:
+        raise GuardError("AccessKey ID 和 AccessKey Secret 不能为空")
+    region_values = []
+    for value in regions if isinstance(regions, (list, tuple)) else [regions]:
+        region = str(value or "").strip()
+        if region and region not in region_values:
+            region_values.append(region)
+    if not region_values:
+        raise GuardError("至少需要一个 Region ID")
+    if len(region_values) > 50:
+        raise GuardError("一次最多扫描 50 个 Region")
+    tag_key = str(tag_key or "").strip()
+    tag_value = str(tag_value or "").strip()
+    results = []
+    errors = []
+    credentials = {"ak": access_key, "sk": secret_key}
+    for region in region_values:
+        try:
+            page = 1
+            while page <= 100:
+                request = DescribeInstancesRequest()
+                request.set_protocol_type("https")
+                request.set_accept_format("json")
+                request.set_PageNumber(page)
+                request.set_PageSize(100)
+                request.set_connect_timeout(5000)
+                request.set_read_timeout(20000)
+                response = make_client(credentials, region).do_action_with_exception(request)
+                data = json.loads(response.decode("utf-8"))
+                instances = data.get("Instances", {}).get("Instance", [])
+                if isinstance(instances, dict):
+                    instances = [instances]
+                if not isinstance(instances, list):
+                    raise GuardError("ECS 返回实例列表格式无法识别")
+                for instance in instances:
+                    if not isinstance(instance, dict):
+                        continue
+                    tags = _instance_tags(instance)
+                    if tag_key and tag_key not in tags:
+                        continue
+                    if tag_key and tag_value and tags.get(tag_key) != tag_value:
+                        continue
+                    instance_id = str(instance.get("InstanceId", "")).strip()
+                    if not instance_id:
+                        continue
+                    results.append(
+                        {
+                            "region": region,
+                            "instance_id": instance_id,
+                            "name": str(instance.get("InstanceName", "") or instance_id),
+                            "status": str(instance.get("Status", "Unknown")),
+                            "zone_id": str(instance.get("ZoneId", "")),
+                            "instance_type": str(instance.get("InstanceType", "")),
+                            "public_ip": str(
+                                (instance.get("PublicIpAddress", {}).get("IpAddress", []) or [""])[0]
+                            ),
+                            "tags": tags,
+                        }
+                    )
+                total = int(data.get("TotalCount", len(instances)) or 0)
+                if page * 100 >= total or not instances:
+                    break
+                page += 1
+        except Exception as exc:
+            errors.append(
+                {
+                    "region": region,
+                    "error": compact_error(exc, secrets=(access_key, secret_key)),
+                }
+            )
+    return {"instances": results, "errors": errors, "regions": region_values}
 
 
 def start_instance(user):
@@ -868,11 +1106,18 @@ def _telegram_post(url, data, timeout, proxies):
         return session.post(url, data=data, timeout=timeout, proxies=proxies)
 
 
-def telegram_api(config, method, data=None):
+def telegram_api(config, method, data=None, request_timeout=None):
     token = str(config.get("bot_token", "")).strip()
     if not token:
         raise GuardError("Telegram Bot Token 未配置")
-    timeout = max(3, int(config.get("timeout_seconds", 12)))
+    timeout = max(
+        3,
+        int(
+            request_timeout
+            if request_timeout is not None
+            else config.get("timeout_seconds", 12)
+        ),
+    )
     retries = max(1, min(5, int(config.get("retries", 3))))
     base_url, proxies = telegram_connection(config)
     url = "{}/bot{}/{}".format(base_url, token, method)
@@ -985,7 +1230,14 @@ def wait_for_status(user, expected, timeout, poll_seconds):
     return latest, latest_error
 
 
-def check_one(user, config, dry_run=False, now=None, scheduled_action=None):
+def check_one(
+    user,
+    config,
+    dry_run=False,
+    now=None,
+    scheduled_action=None,
+    cdt_cycle_cache=None,
+):
     name = str(user.get("name") or user.get("instance_id") or "未命名")
     billing = get_billing_config(user)
     schedule = get_schedule_config(user)
@@ -1023,7 +1275,7 @@ def check_one(user, config, dry_run=False, now=None, scheduled_action=None):
     user_secrets = (user.get("ak"), user.get("sk"))
 
     try:
-        result["traffic_gb"] = query_cdt_traffic_gb(user)
+        result["traffic_gb"] = query_cdt_traffic_gb_for_cycle(user, cdt_cycle_cache)
     except Exception as exc:
         message = "CDT 流量查询失败: {}".format(compact_error(exc, secrets=user_secrets))
         result["errors"].append(message)
@@ -1449,6 +1701,7 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
     if not isinstance(previous_instances, dict):
         previous_instances = {}
     results = []
+    cdt_cycle_cache = {}
     for user in config.get("users", []):
         if _STOP_EVENT.is_set():
             break
@@ -1462,6 +1715,7 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
             dry_run=dry_run,
             now=started_at,
             scheduled_action=transition,
+            cdt_cycle_cache=cdt_cycle_cache,
         )
         results.append(result)
         write_instance_log(user, result, dry_run=dry_run)
@@ -1490,6 +1744,11 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
         dry_run=dry_run,
     )
     save_state(previous_state)
+    if not dry_run:
+        write_heartbeat(
+            "cycle_error" if error_count else "cycle_ok",
+            "{} 个错误".format(error_count) if error_count else "检测完成",
+        )
     return 1 if error_count else 0
 
 
@@ -1511,18 +1770,21 @@ def is_due(config, state, now=None):
 def run_scheduled():
     if (APP_DIR / "disabled").exists():
         return 0
+    config = load_config()
+    now = dt.datetime.now().astimezone()
+    result = 0
     with cycle_lock() as locked:
         if not locked:
             LOGGER.info("已有检测正在运行，本次计划任务跳过")
-            return 0
-        config = load_config()
-        state = load_state()
-        now = dt.datetime.now().astimezone()
-        if not is_due(config, state, now.timestamp()) and not has_due_schedule(
-            config, state, now
-        ):
-            return 0
-        return run_cycle(started_at=now)
+        else:
+            write_heartbeat("scheduled", "计划任务已唤醒")
+            state = load_state()
+            if is_due(config, state, now.timestamp()) or has_due_schedule(
+                config, state, now
+            ):
+                result = run_cycle(started_at=now)
+    run_s3_backup_if_due(config, now)
+    return result
 
 
 def scheduler_wait_seconds(config, state, now=None):
@@ -1534,6 +1796,100 @@ def scheduler_wait_seconds(config, state, now=None):
         regular_wait = max(1.0, int(config["interval_seconds"]) - (now - float(last)))
     minute_wait = 60.05 - (now % 60.0)
     return max(1.0, min(regular_wait, minute_wait))
+
+
+def s3_backup_secrets(config):
+    backup = config.get("s3_backup", {}) if isinstance(config, dict) else {}
+    return tuple(
+        str(backup.get(field, "") or "")
+        for field in (
+            "access_key_id",
+            "secret_access_key",
+            "session_token",
+            "backup_password",
+        )
+        if str(backup.get(field, "") or "")
+    )
+
+
+def run_s3_backup_if_due(config, now=None):
+    backup = config.get("s3_backup", {})
+    if not isinstance(backup, dict) or not backup.get("enabled", False):
+        return None
+    now = now or dt.datetime.now().astimezone()
+    secrets = s3_backup_secrets(config)
+    heartbeat_stop = threading.Event()
+
+    def refresh_backup_heartbeat():
+        while not heartbeat_stop.wait(30):
+            try:
+                write_heartbeat("s3_backup", "S3 加密备份正在上传")
+            except Exception:
+                pass
+
+    write_heartbeat("s3_backup", "检查 S3 自动备份计划")
+    heartbeat_thread = threading.Thread(
+        target=refresh_backup_heartbeat,
+        name="aliyun-guard-s3-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        try:
+            result = s3_backup.run_if_due(backup, CONFIG_FILE.parent, now=now)
+        except Exception as exc:
+            result = {"ok": False, "error": compact_error(exc, secrets=secrets)}
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2)
+        write_heartbeat("daemon_running", "S3 自动备份检查完成")
+    if result is None or result.get("skipped"):
+        return result
+    mode = str(backup.get("notification_mode", "errors"))
+    if result.get("ok"):
+        LOGGER.info(
+            "S3 自动备份成功: %s，清理 %s 份旧备份",
+            result.get("key"),
+            len(result.get("deleted", [])),
+        )
+        should_send = mode == "always"
+        text = (
+            "Aliyun Guard S3 自动备份成功\n"
+            "时间: {}\n"
+            "Bucket: {}\n"
+            "对象: {}\n"
+            "大小: {:.2f} MiB\n"
+            "清理旧备份: {} 份"
+        ).format(
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            result.get("bucket", ""),
+            result.get("key", ""),
+            float(result.get("size", 0)) / 1048576,
+            len(result.get("deleted", [])),
+        )
+    else:
+        LOGGER.error("S3 自动备份失败: %s", result.get("error", "未知错误"))
+        should_send = mode in ("always", "errors")
+        text = (
+            "Aliyun Guard S3 自动备份失败\n"
+            "时间: {}\n"
+            "错误: {}"
+        ).format(
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            compact_error(result.get("error", "未知错误"), secrets=secrets),
+        )
+    if should_send:
+        try:
+            send_telegram_message(config.get("telegram", {}), text)
+        except Exception as exc:
+            LOGGER.error(
+                "S3 备份结果 Telegram 通知失败: %s",
+                compact_error(
+                    exc,
+                    secrets=telegram_secrets(config.get("telegram", {})) + secrets,
+                ),
+            )
+    return result
 
 
 def handle_stop(signum, frame):
@@ -1566,9 +1922,19 @@ def run_daemon():
         web_server = web_panel.start_background(sys.modules[__name__], config)
     except Exception as exc:
         LOGGER.error("网页控制面板启动失败，保活服务继续运行: %s", compact_error(exc))
+    telegram_control_service = None
+    try:
+        import telegram_control
+
+        telegram_control_service = telegram_control.start_background(sys.modules[__name__])
+    except Exception as exc:
+        LOGGER.error("Telegram Bot 控制启动失败，保活服务继续运行: %s", compact_error(exc))
     LOGGER.info("保活服务已启动")
+    write_heartbeat("daemon_started", "后台服务已启动")
     first_cycle = True
     while not _STOP_EVENT.is_set():
+        write_heartbeat("daemon_running", "调度循环正常")
+        now = dt.datetime.now().astimezone()
         with cycle_lock() as locked:
             if locked:
                 try:
@@ -1591,6 +1957,10 @@ def run_daemon():
                     )
             else:
                 LOGGER.warning("已有检测正在运行，本轮跳过")
+        try:
+            run_s3_backup_if_due(config, now)
+        except Exception as exc:
+            LOGGER.error("S3 自动备份调度失败: %s", compact_error(exc))
         first_cycle = False
         try:
             config = load_config()
@@ -1602,6 +1972,8 @@ def run_daemon():
     if web_server is not None:
         web_server.shutdown()
         web_server.server_close()
+    if telegram_control_service is not None:
+        telegram_control_service.shutdown()
     LOGGER.info("保活服务已停止")
     return 0
 
@@ -1615,6 +1987,15 @@ def show_status():
     state = load_state()
     print("配置状态: 正常")
     print("实例数量: {}".format(len(config.get("users", []))))
+    telegram = config.get("telegram", {})
+    control_enabled = bool(telegram.get("control_enabled", True))
+    control_admins = telegram_control_admin_ids(telegram) if control_enabled else []
+    print(
+        "Bot 控制: {}{}".format(
+            "已启用" if control_enabled else "已关闭",
+            "（{} 个管理员）".format(len(control_admins)) if control_enabled else "",
+        )
+    )
     scheduled_users = [
         user
         for user in config.get("users", [])

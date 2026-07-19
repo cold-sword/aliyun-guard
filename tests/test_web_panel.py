@@ -322,6 +322,30 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(data["secure_cookie"])
 
+    def test_update_progress_is_available_during_service_restart(self):
+        progress_dir = Path(self.temp.name) / "app"
+        with mock.patch.object(web_panel.web_actions, "APP_DIR", progress_dir):
+            status, data, _headers = self.request("GET", "/api/update/progress")
+        self.assertEqual(status, 200)
+        self.assertEqual(data["status"], "idle")
+        self.assertEqual(data["progress"], 0)
+
+    def test_update_install_passes_target_version(self):
+        cookie, csrf = self.login()
+        with mock.patch.object(
+            web_panel.web_actions, "install_update", return_value="update-unit"
+        ) as install:
+            status, data, _headers = self.request(
+                "POST",
+                "/api/update/install",
+                {"target_version": "1.5.4"},
+                cookie=cookie,
+                csrf=csrf,
+            )
+        self.assertEqual(status, 202)
+        self.assertEqual(data["pid"], "update-unit")
+        install.assert_called_once_with("1.5.4")
+
     def test_login_dashboard_and_session_do_not_leak_credentials(self):
         cookie, _csrf = self.login()
         status, data, _headers = self.request("GET", "/api/dashboard", cookie=cookie)
@@ -430,6 +454,77 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(saved["interval_seconds"], 600)
         self.assertEqual(saved["notification_mode"], "events")
 
+    def test_backup_and_discovery_endpoints_require_csrf(self):
+        cookie, csrf = self.login()
+        with mock.patch.object(
+            web_panel.web_actions, "DATA_DIR", Path(self.temp.name)
+        ):
+            status, _data, _headers = self.request(
+                "POST",
+                "/api/backup/create",
+                {"password": "correct-password", "include_state": True, "include_logs": False},
+                cookie=cookie,
+            )
+            self.assertEqual(status, 403)
+            status, data, _headers = self.request(
+                "POST",
+                "/api/backup/create",
+                {"password": "correct-password", "include_state": True, "include_logs": False},
+                cookie=cookie,
+                csrf=csrf,
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(data["result"]["filename"].endswith(".agbackup"))
+
+        discovered = {"instances": [], "errors": [], "regions": ["cn-hongkong"]}
+        with mock.patch.object(
+            web_panel.web_actions, "discover_instances", return_value=discovered
+        ) as scan:
+            status, data, _headers = self.request(
+                "POST",
+                "/api/discovery/scan",
+                {"ak": "ak", "sk": "sk", "regions": ["cn-hongkong"]},
+                cookie=cookie,
+                csrf=csrf,
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["result"], discovered)
+        scan.assert_called_once()
+
+    def test_s3_backup_endpoints_require_authentication_and_csrf(self):
+        status, _data, _headers = self.request("GET", "/api/s3-backup/list")
+        self.assertEqual(status, 401)
+        cookie, csrf = self.login()
+        status, _data, _headers = self.request(
+            "POST", "/api/s3-backup/run", {}, cookie=cookie
+        )
+        self.assertEqual(status, 403)
+        result = {
+            "ok": True,
+            "bucket": "guard-backups",
+            "key": "aliyun-guard/test.agbackup",
+            "deleted": [],
+        }
+        with mock.patch.object(
+            web_panel.web_actions, "run_s3_backup_now", return_value=result
+        ) as run:
+            status, data, _headers = self.request(
+                "POST", "/api/s3-backup/run", {}, cookie=cookie, csrf=csrf
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["result"]["key"], result["key"])
+        run.assert_called_once()
+        with mock.patch.object(
+            web_panel.web_actions,
+            "list_s3_backups",
+            return_value=[{"key": result["key"], "name": "test.agbackup"}],
+        ):
+            status, data, _headers = self.request(
+                "GET", "/api/s3-backup/list", cookie=cookie
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["backups"][0]["key"], result["key"])
+
     def test_http_login_works_with_legacy_secure_option_enabled(self):
         self.config["web_panel"]["cookie_secure"] = True
         guard.atomic_write_json(guard.CONFIG_FILE, self.config)
@@ -522,6 +617,8 @@ class WebApiTests(unittest.TestCase):
                 "chat_id": "456",
                 "timeout_seconds": 15,
                 "retries": 2,
+                "control_enabled": True,
+                "control_admin_ids": "7001,7002",
             },
             cookie=cookie,
             csrf=csrf,
@@ -531,6 +628,8 @@ class WebApiTests(unittest.TestCase):
         saved = guard.load_config()["telegram"]
         self.assertEqual(saved["bot_token"], "test-bot-token-private")
         self.assertEqual(saved["chat_id"], "456")
+        self.assertTrue(saved["control_enabled"])
+        self.assertEqual(saved["control_admin_ids"], [7001, 7002])
 
 
 class ManualControlTests(unittest.TestCase):
@@ -581,8 +680,76 @@ class ManualControlTests(unittest.TestCase):
         self.assertEqual(raised.exception.status, 409)
         stop.assert_not_called()
 
+    def test_bot_threshold_override_pauses_monitor_before_start(self):
+        config = make_config()
+        config["users"][0]["paused"] = False
+        config["users"][0]["schedule"]["enabled"] = False
+        with mock.patch.object(guard, "load_config", return_value=config), mock.patch.object(
+            guard, "query_instance_status", return_value="Stopped"
+        ), mock.patch.object(
+            guard, "query_cdt_traffic_gb", return_value=200.0
+        ), mock.patch.object(guard, "start_instance") as start, mock.patch.object(
+            guard, "wait_for_status", return_value=("Running", None)
+        ), mock.patch.object(guard, "atomic_write_json") as save_config, mock.patch.object(
+            guard, "send_telegram_message"
+        ) as notify, mock.patch.object(
+            guard, "load_state", return_value={"instances": {}, "history": []}
+        ), mock.patch.object(guard, "save_state"), mock.patch.object(
+            guard, "write_instance_log"
+        ):
+            result = web_panel.control_instance(
+                guard,
+                0,
+                "start",
+                source="Telegram Bot",
+                notify=False,
+                allow_threshold_override=True,
+                pause_on_threshold_override=True,
+            )
+        start.assert_called_once()
+        save_config.assert_called_once()
+        notify.assert_not_called()
+        self.assertTrue(config["users"][0]["paused"])
+        self.assertTrue(result["threshold_overridden"])
+        self.assertTrue(result["monitor_paused"])
+        self.assertIn("已自动暂停", result["message"])
+
+    def test_failed_threshold_override_reports_monitor_remains_paused(self):
+        config = make_config()
+        config["users"][0]["schedule"]["enabled"] = False
+        with mock.patch.object(guard, "load_config", return_value=config), mock.patch.object(
+            guard, "query_instance_status", return_value="Stopped"
+        ), mock.patch.object(
+            guard, "query_cdt_traffic_gb", return_value=200.0
+        ), mock.patch.object(
+            guard, "start_instance", side_effect=RuntimeError("StartFailed")
+        ), mock.patch.object(guard, "atomic_write_json"), mock.patch.object(
+            guard, "write_instance_log"
+        ):
+            with self.assertRaises(web_panel.WebPanelError) as raised:
+                web_panel.control_instance(
+                    guard,
+                    0,
+                    "start",
+                    source="Telegram Bot",
+                    notify=False,
+                    allow_threshold_override=True,
+                    pause_on_threshold_override=True,
+                )
+        self.assertTrue(config["users"][0]["paused"])
+        self.assertIn("监控已暂停", str(raised.exception))
+
 
 class WebHtmlTests(unittest.TestCase):
+    def test_update_panel_has_real_progress_and_reconnect_polling(self):
+        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
+        self.assertIn('id="updateProgressBar"', html)
+        self.assertIn('id="updateProgressPercent"', html)
+        self.assertIn('/api/update/progress', html)
+        self.assertIn('async function pollUpdateProgress()', html)
+        self.assertIn('后台服务重启中，正在重新连接', html)
+        self.assertIn('target_version: state.update.latest_version', html)
+
     def test_sparkline_points_keep_fixed_size_and_edge_padding(self):
         html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
         self.assertIn("const chartLeft = 4, chartRight = 316", html)
@@ -601,6 +768,39 @@ class WebHtmlTests(unittest.TestCase):
         self.assertIn("记录该实例独立日志", html)
         self.assertIn("instanceLogToggle", html)
         self.assertIn("删除监控实例", html)
+        self.assertIn('id="tgControlEnabled"', html)
+        self.assertIn('id="tgControlAdmins"', html)
+        self.assertIn("control_admin_ids", html)
+
+    def test_backup_discovery_and_watchdog_controls_are_complete(self):
+        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
+        panel = (ROOT / "src" / "web_panel.py").read_text(encoding="utf-8")
+        for marker in (
+            'id="discoverInstanceButton"',
+            'id="discoveryDialog"',
+            "/api/discovery/scan",
+            "/api/discovery/import",
+            'id="backupCreateForm"',
+            'id="backupRestoreForm"',
+            "/api/backup/preview",
+            "/api/backup/restore",
+            'id="rollbackButton"',
+            'id="watchdogEnabled"',
+            "failure_threshold",
+            'id="s3BackupForm"',
+            'id="s3IamRole"',
+            'id="s3BackupList"',
+            "/api/s3-backup/settings",
+            "/api/s3-backup/test",
+            "/api/s3-backup/run",
+            "/api/s3-backup/list",
+            "/api/s3-backup/preview",
+            "/api/s3-backup/restore",
+        ):
+            self.assertIn(marker, html)
+        self.assertIn("MAX_BODY_BYTES = 128 * 1024 * 1024", panel)
+        self.assertIn("backup_upload", panel)
+        self.assertIn("else 1024 * 1024", panel)
 
 if __name__ == "__main__":
     unittest.main()
