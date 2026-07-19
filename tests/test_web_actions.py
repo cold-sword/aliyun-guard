@@ -1,6 +1,7 @@
 import copy
 import json
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -91,6 +92,27 @@ class WebActionTests(unittest.TestCase):
         self.assertNotIn("access_key", payload["instances"][0])
         self.assertFalse(payload["instances"][0]["instance_log_enabled"])
         self.assertEqual(payload["telegram"]["nodes"][0]["description"], "VLESS 节点（Saved）")
+        self.assertTrue(payload["telegram"]["control_enabled"])
+        self.assertEqual(payload["telegram"]["control_effective_admin_ids"], [123456])
+        self.assertTrue(payload["telegram"]["control_uses_chat_id"])
+
+    def test_updates_bot_control_admins(self):
+        result = web_actions.update_telegram_identity(
+            guard,
+            {
+                "bot_token": "",
+                "chat_id": "123456",
+                "timeout_seconds": 12,
+                "retries": 3,
+                "control_enabled": True,
+                "control_admin_ids": "9001, 9002",
+            },
+        )
+        self.assertTrue(result["control_enabled"])
+        self.assertEqual(result["control_admin_ids"], [9001, 9002])
+        self.assertEqual(result["control_effective_admin_ids"], [9001, 9002])
+        saved = guard.load_config()["telegram"]
+        self.assertEqual(saved["control_admin_ids"], [9001, 9002])
 
     def test_instance_logging_switch_persists(self):
         result = web_actions.update_instance_logging(guard, 0, True)
@@ -100,6 +122,77 @@ class WebActionTests(unittest.TestCase):
         result = web_actions.update_instance_logging(guard, 0, False)
         self.assertFalse(result["enabled"])
         self.assertFalse(guard.load_config()["users"][0]["instance_log_enabled"])
+
+    def test_discovery_response_is_redacted_and_imports_selected_instances(self):
+        discovered = {
+            "instances": [
+                {
+                    "region": "cn-hongkong",
+                    "instance_id": "i-discovered",
+                    "name": "Discovered",
+                    "status": "Running",
+                    "zone_id": "cn-hongkong-b",
+                    "instance_type": "ecs.t6-c1m1.large",
+                    "public_ip": "203.0.113.2",
+                    "tags": {"env": "prod"},
+                }
+            ],
+            "errors": [],
+            "regions": ["cn-hongkong"],
+        }
+        with mock.patch.object(
+            guard, "discover_ecs_instances", return_value=discovered
+        ):
+            result = web_actions.discover_instances(
+                guard,
+                {
+                    "ak": "scan-ak",
+                    "sk": "scan-sk",
+                    "regions": ["cn-hongkong"],
+                    "tag_key": "env",
+                    "tag_value": "prod",
+                },
+            )
+        serialized = json.dumps(result)
+        self.assertNotIn("scan-ak", serialized)
+        self.assertNotIn("scan-sk", serialized)
+        imported = web_actions.import_discovered_instances(
+            guard,
+            {
+                "ak": "scan-ak",
+                "sk": "scan-sk",
+                "instances": result["instances"],
+                "traffic_limit_gb": 150,
+                "actions_enabled": True,
+                "billing_site": "china",
+            },
+        )
+        self.assertEqual(imported["count"], 1)
+        saved = guard.load_config()["users"][-1]
+        self.assertEqual(saved["instance_id"], "i-discovered")
+        self.assertEqual(saved["sk"], "scan-sk")
+
+    def test_discovery_without_regions_uses_account_region_list(self):
+        with mock.patch.object(
+            guard, "discover_ecs_regions", return_value=["cn-hongkong"]
+        ) as regions, mock.patch.object(
+            guard,
+            "discover_ecs_instances",
+            return_value={"instances": [], "errors": [], "regions": ["cn-hongkong"]},
+        ) as scan:
+            web_actions.discover_instances(
+                guard, {"ak": "scan-ak", "sk": "scan-sk", "regions": []}
+            )
+        regions.assert_called_once_with("scan-ak", "scan-sk")
+        self.assertEqual(scan.call_args.args[2], ["cn-hongkong"])
+
+    def test_backup_creation_never_returns_plaintext_secret(self):
+        with mock.patch.object(web_actions, "DATA_DIR", Path(self.temp.name)):
+            result = web_actions.create_encrypted_backup(
+                {"password": "correct-password", "include_state": True, "include_logs": False}
+            )
+        self.assertNotIn("private-secret-key", result["backup_base64"])
+        self.assertTrue(result["filename"].endswith(".agbackup"))
 
     def test_failed_instance_validation_does_not_save_without_force(self):
         data = {
@@ -244,6 +337,118 @@ class WebActionTests(unittest.TestCase):
                 web_actions.install_update()
         self.assertEqual(raised.exception.status, 409)
         self.assertIn("docker compose", str(raised.exception))
+
+    def test_systemd_update_uses_independent_transient_unit(self):
+        app_dir = Path(self.temp.name) / "app"
+        app_dir.mkdir()
+        manager_path = app_dir / "manager.py"
+        manager_path.write_text("# manager\n", encoding="utf-8")
+        (app_dir / "service_backend").write_text("systemd\n", encoding="utf-8")
+        completed = subprocess.CompletedProcess([], 0, "")
+        with mock.patch.dict("os.environ", {"ALIYUN_GUARD_CONTAINER": "0"}), mock.patch.object(
+            web_actions, "APP_DIR", app_dir
+        ), mock.patch.object(
+            web_actions.shutil, "which", return_value="/usr/bin/systemd-run"
+        ), mock.patch.object(
+            web_actions.subprocess, "run", return_value=completed
+        ) as run, mock.patch.object(
+            web_actions, "detached_process"
+        ) as detached:
+            unit = web_actions.install_update("1.5.4")
+        self.assertTrue(unit.startswith("aliyun-guard-update-"))
+        detached.assert_not_called()
+        launcher = run.call_args.args[0]
+        self.assertEqual(launcher[0], "/usr/bin/systemd-run")
+        self.assertIn("--no-block", launcher)
+        self.assertIn("--property=StandardInput=null", launcher)
+        self.assertIn("--unit={}".format(unit), launcher)
+        self.assertIn(str(manager_path), launcher)
+        self.assertIn(str(app_dir / "logs" / "web-update.log"), launcher)
+        self.assertIn("-u", launcher)
+        self.assertTrue(any(web_actions.UPDATE_EXIT_MARKER in item for item in launcher))
+        state = json.loads(
+            (app_dir / "logs" / web_actions.UPDATE_STATE_NAME).read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(state["target_version"], "1.5.4")
+        self.assertEqual(state["job"], unit)
+
+    def test_systemd_update_without_systemd_run_reports_cli_fallback(self):
+        app_dir = Path(self.temp.name) / "app"
+        app_dir.mkdir()
+        (app_dir / "manager.py").write_text("# manager\n", encoding="utf-8")
+        (app_dir / "service_backend").write_text("systemd\n", encoding="utf-8")
+        with mock.patch.dict("os.environ", {"ALIYUN_GUARD_CONTAINER": "0"}), mock.patch.object(
+            web_actions, "APP_DIR", app_dir
+        ), mock.patch.object(web_actions.shutil, "which", return_value=None):
+            with self.assertRaises(web_actions.ManagementError) as raised:
+                web_actions.install_update()
+        self.assertIn("aliyun-guard update", str(raised.exception))
+
+    def test_non_systemd_update_keeps_detached_process_fallback(self):
+        app_dir = Path(self.temp.name) / "app"
+        app_dir.mkdir()
+        manager_path = app_dir / "manager.py"
+        manager_path.write_text("# manager\n", encoding="utf-8")
+        (app_dir / "service_backend").write_text("openrc\n", encoding="utf-8")
+        with mock.patch.dict("os.environ", {"ALIYUN_GUARD_CONTAINER": "0"}), mock.patch.object(
+            web_actions, "APP_DIR", app_dir
+        ), mock.patch.object(
+            web_actions, "detached_process", return_value=77
+        ) as detached:
+            self.assertEqual(web_actions.install_update(), 77)
+        command, log_name = detached.call_args.args
+        self.assertEqual(command[:2], ["/bin/sh", "-c"])
+        self.assertIn(web_actions.UPDATE_EXIT_MARKER, command[2])
+        self.assertIn(sys.executable, command)
+        self.assertIn("-u", command)
+        self.assertIn(str(manager_path), command)
+        self.assertEqual(log_name, web_actions.UPDATE_LOG_NAME)
+
+    def test_update_progress_tracks_installer_stages_and_success(self):
+        app_dir = Path(self.temp.name) / "app"
+        with mock.patch.object(web_actions, "APP_DIR", app_dir):
+            web_actions._prepare_update_tracking("1.5.4", "systemd")
+            log_path = app_dir / "logs" / web_actions.UPDATE_LOG_NAME
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write("正在下载更新和校验文件...\n")
+                handle.write("SHA-256 校验通过\n")
+                handle.write("[3/6] 写入程序文件...\n")
+            running = web_actions.update_progress()
+            self.assertEqual(running["status"], "running")
+            self.assertEqual(running["progress"], 62)
+            self.assertEqual(running["target_version"], "1.5.4")
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write("GitHub 最新版本已安装，后台服务已重启。\n")
+                handle.write(web_actions.UPDATE_EXIT_MARKER + "0\n")
+            complete = web_actions.update_progress()
+        self.assertEqual(complete["status"], "success")
+        self.assertEqual(complete["progress"], 100)
+
+    def test_update_progress_reports_nonzero_exit(self):
+        app_dir = Path(self.temp.name) / "app"
+        with mock.patch.object(web_actions, "APP_DIR", app_dir):
+            web_actions._prepare_update_tracking("1.5.4", "systemd")
+            log_path = app_dir / "logs" / web_actions.UPDATE_LOG_NAME
+            with log_path.open("a", encoding="utf-8") as handle:
+                handle.write("[2/6] 创建 Python 独立环境...\n")
+                handle.write(web_actions.UPDATE_EXIT_MARKER + "2\n")
+            result = web_actions.update_progress()
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["progress"], 48)
+
+    def test_second_web_update_is_rejected_while_job_is_running(self):
+        app_dir = Path(self.temp.name) / "app"
+        app_dir.mkdir()
+        (app_dir / "manager.py").write_text("# manager\n", encoding="utf-8")
+        (app_dir / "service_backend").write_text("systemd\n", encoding="utf-8")
+        with mock.patch.object(web_actions, "APP_DIR", app_dir):
+            web_actions._prepare_update_tracking("1.5.4", "systemd")
+            with self.assertRaises(web_actions.ManagementError) as raised:
+                web_actions.install_update("1.5.4")
+        self.assertEqual(raised.exception.status, 409)
+        self.assertIn("正在运行", str(raised.exception))
 
     def test_update_check_identifies_container_deployment(self):
         with mock.patch.dict("os.environ", {"ALIYUN_GUARD_CONTAINER": "1"}), mock.patch(

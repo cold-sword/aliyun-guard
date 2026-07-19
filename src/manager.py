@@ -17,6 +17,8 @@ import urllib.parse
 import urllib.request
 
 import aliyun_guard as guard
+import backup_manager
+import s3_backup
 import telegram_proxy
 import web_panel
 
@@ -24,16 +26,25 @@ import web_panel
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 CONFIG_FILE = Path(os.environ.get("ALIYUN_GUARD_CONFIG", APP_DIR / "config.json"))
 CONTROL_FILE = APP_DIR / "control.sh"
-UPDATE_BASE_URL = os.environ.get(
-    "ALIYUN_GUARD_UPDATE_BASE",
-    "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
-).rstrip("/")
-APP_VERSION = "1.5.0"
+UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
+UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
+UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
+UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
+APP_VERSION = "1.5.9"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
 ANSI_RESET = "\033[0m"
+
+
+def update_asset_base_url(version=None):
+    if UPDATE_CUSTOM_BASE_URL:
+        return UPDATE_CUSTOM_BASE_URL
+    if version:
+        normalized = str(version).strip().lstrip("v")
+        return UPDATE_RELEASES_URL + "/download/v" + normalized
+    return UPDATE_BASE_URL
 
 REGIONS = [
     ("cn-hongkong", "中国香港"),
@@ -521,15 +532,60 @@ def _set_telegram_identity(candidate):
     )
 
 
+def telegram_control_status(telegram):
+    if not telegram.get("control_enabled", True):
+        return "已关闭"
+    admins = guard.telegram_control_admin_ids(telegram)
+    explicit = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    if not admins:
+        return "已启用，但未配置有效管理员"
+    source = "独立名单" if explicit else "使用私聊 Chat ID"
+    return "已启用，{} 个管理员（{}）".format(len(admins), source)
+
+
+def configure_telegram_control(telegram):
+    title("Telegram Bot 控制")
+    print("当前状态: {}".format(telegram_control_status(telegram)))
+    enabled = yes_no(
+        "启用 Telegram Bot 控制", bool(telegram.get("control_enabled", True))
+    )
+    telegram["control_enabled"] = enabled
+    if not enabled:
+        print("Bot 控制已关闭，Telegram 通知不受影响。")
+        return telegram
+    explicit = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    default = ",".join(str(value) for value in explicit) if explicit else "auto"
+    raw = prompt(
+        "管理员 Telegram 用户 ID（逗号分隔；auto 使用私聊 Chat ID）",
+        default,
+        required=True,
+    )
+    if raw.strip().lower() == "auto":
+        telegram["control_admin_ids"] = []
+    else:
+        telegram["control_admin_ids"] = guard.normalize_telegram_control_admin_ids(raw)
+    admins = guard.telegram_control_admin_ids(telegram)
+    if admins:
+        print("Bot 控制管理员: {}".format(", ".join(str(value) for value in admins)))
+    else:
+        print("警告: 当前没有有效管理员，Bot 控制不会接受任何命令。")
+    return telegram
+
+
 def configure_telegram_connection(candidate, force_ipv4=True, initial=False, active=None):
     while True:
-        title("Telegram 连接方式")
+        title("Telegram 连接与 Bot 控制")
         status_source = active if active is not None else candidate
         for line in telegram_connection_status_lines(status_source):
             print(line)
         if active is not None and _telegram_connection_signature(candidate) != _telegram_connection_signature(active):
             for line in telegram_connection_status_lines(candidate, prefix="待保存"):
                 print(line)
+        print("Bot 控制: {}".format(telegram_control_status(candidate)))
         print("")
         print(" 1) 直连")
         print(" 2) SOCKS5 代理")
@@ -544,7 +600,8 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
         print(" 7) 取消并返回")
         print(" 8) 单独检测当前选择（不保存）")
         print(" 9) 测试并保存")
-        choice = prompt_int("请选择", 9, 1, 9)
+        print("10) Bot 控制设置")
+        choice = prompt_int("请选择", 10, 1, 10)
         if choice == 1:
             previous = json.loads(json.dumps(candidate, ensure_ascii=False))
             candidate["connection_mode"] = "direct"
@@ -615,6 +672,9 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                 _set_telegram_identity(candidate)
             if yes_no("测试失败，仍保存当前 Telegram 配置", default=False):
                 return candidate, False
+        elif choice == 10:
+            configure_telegram_control(candidate)
+            return candidate, True
 
 
 def configure_telegram(config, initial=False):
@@ -623,6 +683,10 @@ def configure_telegram(config, initial=False):
     candidate = json.loads(json.dumps(current, ensure_ascii=False))
     print("Token、代理密码和节点链接只保存在本机 root 可读的配置文件中。")
     _set_telegram_identity(candidate)
+    candidate.setdefault("control_enabled", True)
+    candidate.setdefault("control_admin_ids", [])
+    if initial:
+        print("Telegram Bot 控制默认开启，未单独设置时使用正数私聊 Chat ID 授权。")
     candidate["timeout_seconds"] = prompt_int(
         "Telegram 请求超时（秒）", candidate.get("timeout_seconds", 12), 3, 60
     )
@@ -1050,6 +1114,27 @@ def edit_settings(config):
     config["stop_wait_seconds"] = prompt_int(
         "停止实例后等待确认时间（秒）", config.get("stop_wait_seconds", 45), 0, 600
     )
+    current_watchdog = config.get("watchdog", {})
+    if not isinstance(current_watchdog, dict):
+        current_watchdog = {}
+    config["watchdog"] = {
+        "enabled": yes_no(
+            "启用监控失联告警与自动重启",
+            bool(current_watchdog.get("enabled", True)),
+        ),
+        "timeout_seconds": prompt_int(
+            "心跳失联超时（秒）",
+            current_watchdog.get("timeout_seconds", 600),
+            120,
+            86400,
+        ),
+        "failure_threshold": prompt_int(
+            "连续失败多少次后告警",
+            current_watchdog.get("failure_threshold", 2),
+            1,
+            10,
+        ),
+    }
     save_config(config)
     print("全局设置已保存。服务会在下一轮自动读取新配置。")
 
@@ -1195,7 +1280,8 @@ def update_from_github(confirm_update=True, release_info=None):
         print("最新版本: v{}".format(target_version))
     else:
         print("最新版本: 暂时无法获取（仍可继续更新）")
-    print("更新来源: {}".format(UPDATE_BASE_URL))
+    asset_base_url = update_asset_base_url(target_version)
+    print("更新来源: {}".format(asset_base_url))
     print("现有 config.json、state.json 和日志会保留。")
     confirm_text = "下载并安装 GitHub main 分支最新版本"
     if target_version:
@@ -1204,8 +1290,8 @@ def update_from_github(confirm_update=True, release_info=None):
         print("已取消更新。")
         return None
 
-    installer_url = UPDATE_BASE_URL + "/install.sh"
-    checksum_url = UPDATE_BASE_URL + "/install.sh.sha256"
+    installer_url = asset_base_url + "/install.sh"
+    checksum_url = asset_base_url + "/install.sh.sha256"
     print("正在下载更新和校验文件...")
     try:
         installer = download_update_file(installer_url)
@@ -1222,12 +1308,17 @@ def update_from_github(confirm_update=True, release_info=None):
 
     temporary_path = None
     try:
+        snapshot = backup_manager.create_program_snapshot(APP_DIR, APP_VERSION)
+        print("更新前程序快照: {}".format(snapshot))
         with tempfile.NamedTemporaryFile(prefix="aliyun-guard-update-", suffix=".sh", delete=False) as handle:
             handle.write(installer)
             temporary_path = handle.name
         os.chmod(temporary_path, 0o700)
         print("SHA-256 校验通过: {}".format(actual))
-        result = subprocess.call(["/bin/sh", temporary_path, "--update"])
+        result = subprocess.call(
+            ["/bin/sh", temporary_path, "--update"],
+            stdin=subprocess.DEVNULL,
+        )
     except Exception as exc:
         print("执行更新失败: {}".format(guard.compact_error(exc)))
         return False
@@ -1243,6 +1334,336 @@ def update_from_github(confirm_update=True, release_info=None):
         return False
     print("GitHub 最新版本已安装，后台服务已重启。")
     return True
+
+
+def backup_restore_menu():
+    while True:
+        title("备份、恢复与版本回滚")
+        snapshots = backup_manager.list_program_snapshots(app_dir=APP_DIR)
+        print("程序回滚快照: {} 个".format(len(snapshots)))
+        print(" 1) 创建加密备份")
+        print(" 2) 预览备份差异")
+        print(" 3) 恢复加密备份")
+        print(" 4) 回滚到更新前程序版本")
+        print(" 5) 返回")
+        choice = prompt_int("请输入序号", 1, 1, 5)
+        if choice == 5:
+            return
+        try:
+            if choice == 1:
+                password = prompt_secret("备份密码（至少 8 个字符）")
+                confirmation = prompt_secret("再次输入备份密码")
+                if password != confirmation:
+                    print("两次输入的密码不一致。")
+                    continue
+                path = backup_manager.create_backup(
+                    password,
+                    guard.CONFIG_FILE.parent,
+                    include_state=yes_no("包含状态文件", True),
+                    include_logs=yes_no("包含日志", True),
+                )
+                print("加密备份已创建: {}".format(path))
+            elif choice in (2, 3):
+                path = Path(prompt("备份文件完整路径", required=True)).expanduser()
+                password = prompt_secret("备份密码")
+                preview = backup_manager.preview_restore(
+                    path, password, guard.CONFIG_FILE.parent
+                )
+                summary = preview.get("summary", {})
+                print(
+                    "备份配置: {} 个实例，{} 个节点".format(
+                        summary.get("instances", 0), summary.get("nodes", 0)
+                    )
+                )
+                for item in preview.get("files", []):
+                    print(" - {:<9} {}".format(item["action"], item["path"]))
+                if choice == 3 and yes_no("确认按以上差异恢复", False):
+                    result = backup_manager.restore_backup(
+                        path, password, guard.CONFIG_FILE.parent
+                    )
+                    print("已恢复 {} 个文件。".format(len(result["restored"])))
+                    print("恢复前安全备份: {}".format(result["safety_backup"]))
+                    run_control("restart")
+            elif choice == 4:
+                if not snapshots:
+                    print("当前没有程序回滚快照。")
+                    continue
+                for index, path in enumerate(snapshots, 1):
+                    print(" {:>2}) {}".format(index, path.name))
+                index = prompt_int("选择快照", 1, 1, len(snapshots)) - 1
+                if yes_no("确认恢复程序文件并重启服务", False):
+                    result = backup_manager.restore_program_snapshot(
+                        snapshots[index], APP_DIR
+                    )
+                    print("程序已回滚到快照版本: {}".format(result["version"]))
+                    run_control("restart")
+        except backup_manager.BackupError as exc:
+            print("操作失败: {}".format(exc))
+
+
+def collect_s3_backup_settings(config):
+    current = s3_backup.normalized_config(config.get("s3_backup", {}))
+    title("S3 自动备份设置")
+    candidate = dict(current)
+    candidate["enabled"] = yes_no("启用 S3 自动备份", current["enabled"])
+    candidate["bucket"] = prompt(
+        "Bucket 名称", current["bucket"], required=candidate["enabled"]
+    )
+    candidate["region"] = prompt("AWS/S3 Region", current["region"], required=True)
+    candidate["endpoint_url"] = prompt(
+        "自定义 Endpoint（AWS S3 留空）", current["endpoint_url"]
+    ).rstrip("/")
+    candidate["prefix"] = prompt("对象目录前缀", current["prefix"])
+    styles = [("auto", "自动"), ("path", "路径寻址"), ("virtual", "虚拟主机寻址")]
+    print("\nS3 寻址方式：")
+    default_style = next(
+        (index for index, item in enumerate(styles, 1) if item[0] == current["addressing_style"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(styles, 1):
+        print(" {}) {}".format(index, label))
+    candidate["addressing_style"] = styles[
+        prompt_int("寻址方式", default_style, 1, len(styles)) - 1
+    ][0]
+    use_role = yes_no("使用 EC2 IAM Role/环境凭据", not bool(current["access_key_id"]))
+    if use_role:
+        candidate["access_key_id"] = ""
+        candidate["secret_access_key"] = ""
+        candidate["session_token"] = ""
+    else:
+        candidate["access_key_id"] = prompt_secret(
+            "AWS Access Key ID",
+            keep_existing=not candidate["enabled"] or bool(current["access_key_id"]),
+        ) or current["access_key_id"]
+        candidate["secret_access_key"] = prompt_secret(
+            "AWS Secret Access Key",
+            keep_existing=not candidate["enabled"] or bool(current["secret_access_key"]),
+        ) or current["secret_access_key"]
+        candidate["session_token"] = prompt_secret(
+            "AWS Session Token（长期密钥留空）", keep_existing=True
+        ) or current["session_token"]
+    candidate["backup_password"] = prompt_secret(
+        "自动备份加密密码（至少 8 位）",
+        keep_existing=not candidate["enabled"] or bool(current["backup_password"]),
+    ) or current["backup_password"]
+    schedules = [("hourly", "每小时"), ("daily", "每天"), ("weekly", "每周")]
+    print("\n自动备份周期：")
+    default_schedule = next(
+        (index for index, item in enumerate(schedules, 1) if item[0] == current["schedule"]),
+        2,
+    )
+    for index, (_value, label) in enumerate(schedules, 1):
+        print(" {}) {}".format(index, label))
+    candidate["schedule"] = schedules[
+        prompt_int("周期", default_schedule, 1, len(schedules)) - 1
+    ][0]
+    candidate["time"] = prompt(
+        "执行时间 HH:MM（每小时仅使用分钟）", current["time"], required=True
+    )
+    if candidate["schedule"] == "weekly":
+        candidate["weekday"] = prompt_int(
+            "星期（0=周一，6=周日）", current["weekday"], 0, 6
+        )
+    candidate["retention"] = prompt_int(
+        "云端和本地保留份数", current["retention"], 1, 365
+    )
+    candidate["include_state"] = yes_no("包含运行状态", current["include_state"])
+    candidate["include_logs"] = yes_no("包含日志", current["include_logs"])
+    notifications = [("errors", "仅失败通知"), ("always", "成功和失败都通知"), ("none", "不通知")]
+    print("\nTelegram 通知：")
+    default_notice = next(
+        (index for index, item in enumerate(notifications, 1) if item[0] == current["notification_mode"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(notifications, 1):
+        print(" {}) {}".format(index, label))
+    candidate["notification_mode"] = notifications[
+        prompt_int("通知方式", default_notice, 1, len(notifications)) - 1
+    ][0]
+    encryptions = [("AES256", "SSE-S3"), ("aws:kms", "SSE-KMS"), ("", "关闭服务端加密")]
+    print("\nS3 服务端加密：")
+    default_encryption = next(
+        (index for index, item in enumerate(encryptions, 1) if item[0] == current["server_side_encryption"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(encryptions, 1):
+        print(" {}) {}".format(index, label))
+    candidate["server_side_encryption"] = encryptions[
+        prompt_int("加密方式", default_encryption, 1, len(encryptions)) - 1
+    ][0]
+    if candidate["server_side_encryption"] == "aws:kms":
+        candidate["kms_key_id"] = prompt_secret(
+            "KMS Key ID/ARN", keep_existing=bool(current["kms_key_id"])
+        ) or current["kms_key_id"]
+    else:
+        candidate["kms_key_id"] = ""
+    return s3_backup.validate_config(candidate, require_ready=candidate["enabled"])
+
+
+def print_s3_backups(items):
+    if not items:
+        print("云端没有 Aliyun Guard 加密备份。")
+        return
+    for index, item in enumerate(items, 1):
+        print(
+            " {:>3}) {:<42} {:>8.2f} MiB  {}".format(
+                index,
+                item["name"][:42],
+                float(item["size"]) / 1048576,
+                item.get("modified_at", ""),
+            )
+        )
+
+
+def s3_backup_menu(config):
+    while True:
+        current = s3_backup.normalized_config(config.get("s3_backup", {}))
+        status = s3_backup.read_status(CONFIG_FILE.parent)
+        title("AWS S3 / S3 兼容存储自动备份")
+        print("状态: {}".format("已启用" if current["enabled"] else "已关闭"))
+        print("Bucket: {}".format(current["bucket"] or "未配置"))
+        print("最近成功: {}".format(status.get("last_success_at") or "尚未运行"))
+        if status.get("last_error"):
+            print("最近错误: {}".format(status["last_error"]))
+        print("\n 1) 配置自动备份")
+        print(" 2) 测试当前 S3 连接")
+        print(" 3) 立即创建并上传加密备份")
+        print(" 4) 查看云端备份")
+        print(" 5) 从云端预览并恢复")
+        print(" 6) 返回")
+        choice = prompt_int("请输入序号", 6, 1, 6)
+        if choice == 6:
+            return
+        try:
+            if choice == 1:
+                candidate = collect_s3_backup_settings(config)
+                if candidate["enabled"]:
+                    print("正在测试 S3 连接...")
+                    result = s3_backup.test_connection(candidate)
+                    print("连接成功，延迟约 {} ms。".format(result["latency_ms"]))
+                config["s3_backup"] = candidate
+                save_config(config)
+                print("S3 自动备份设置已保存。")
+            elif choice == 2:
+                result = s3_backup.test_connection(current)
+                print("连接成功：{} / {}，延迟约 {} ms。".format(result["bucket"], result["endpoint"], result["latency_ms"]))
+            elif choice == 3:
+                result = s3_backup.create_and_upload(current, CONFIG_FILE.parent)
+                print("上传成功: s3://{}/{}".format(result["bucket"], result["key"]))
+                print("已清理云端旧备份 {} 份。".format(len(result["deleted"])))
+            elif choice in (4, 5):
+                items = s3_backup.list_backups(current, limit=100)
+                print_s3_backups(items)
+                if choice == 5 and items:
+                    index = prompt_int("选择要恢复的备份", 1, 1, len(items)) - 1
+                    path = s3_backup.download_backup(current, items[index]["key"], CONFIG_FILE.parent)
+                    try:
+                        preview = backup_manager.preview_restore(path, current["backup_password"], CONFIG_FILE.parent)
+                        for item in preview.get("files", []):
+                            print(" - {:<9} {}".format(item["action"], item["path"]))
+                        if yes_no("确认按以上差异恢复并重启服务", False):
+                            result = backup_manager.restore_backup(
+                                path,
+                                current["backup_password"],
+                                CONFIG_FILE.parent,
+                                include_logs=yes_no("恢复备份中的日志", True),
+                            )
+                            print("恢复完成，恢复前安全备份: {}".format(result["safety_backup"]))
+                            run_control("restart")
+                    finally:
+                        path.unlink(missing_ok=True)
+        except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+            print("S3 备份操作失败: {}".format(exc))
+
+
+def discover_instances_menu(config):
+    title("自动发现阿里云 ECS")
+    ak = prompt_secret("AccessKey ID")
+    sk = prompt_secret("AccessKey Secret")
+    regions_text = prompt(
+        "扫描 Region（逗号分隔，留空扫描内置 Region）", ""
+    )
+    regions = [
+        item.strip()
+        for item in regions_text.replace(";", ",").split(",")
+        if item.strip()
+    ]
+    if not regions:
+        print("正在从阿里云账号读取可用 Region...")
+        regions = guard.discover_ecs_regions(ak, sk)
+    tag_key = prompt("标签键筛选（可留空）", "")
+    tag_value = prompt("标签值筛选（可留空）", "") if tag_key else ""
+    if config.get("force_ipv4", True):
+        guard.enable_ipv4_only()
+    result = guard.discover_ecs_instances(ak, sk, regions, tag_key, tag_value)
+    instances = result.get("instances", [])
+    for error in result.get("errors", []):
+        print("[{}] 扫描失败: {}".format(error["region"], error["error"]))
+    if not instances:
+        print("没有发现符合条件的 ECS 实例。")
+        return
+    title("发现 {} 台 ECS".format(len(instances)))
+    for index, item in enumerate(instances, 1):
+        print(
+            "{:>3}) {:<20} {:<18} {:<22} {}".format(
+                index,
+                item["region"],
+                item["status"],
+                item["instance_id"],
+                item["name"],
+            )
+        )
+    selection = prompt("选择序号（逗号分隔，输入 all 全选）", "all")
+    if selection.lower() == "all":
+        indexes = list(range(len(instances)))
+    else:
+        try:
+            indexes = sorted(
+                {
+                    int(value.strip()) - 1
+                    for value in selection.replace(";", ",").split(",")
+                    if value.strip()
+                }
+            )
+        except ValueError:
+            print("选择格式无效。")
+            return
+    selected = [instances[index] for index in indexes if 0 <= index < len(instances)]
+    if not selected:
+        print("没有选择有效实例。")
+        return
+    limit = prompt_float("统一 CDT 关机阈值（GB）", 180, 0.01)
+    actions_enabled = yes_no("允许自动开关机", True)
+    billing = configure_billing({})
+    existing = {
+        (str(item.get("ak")), str(item.get("region")), str(item.get("instance_id")))
+        for item in config.get("users", [])
+    }
+    imported = 0
+    for item in selected:
+        identity = (ak, item["region"], item["instance_id"])
+        if identity in existing:
+            continue
+        config.setdefault("users", []).append(
+            {
+                "name": item["name"] or item["instance_id"],
+                "ak": ak,
+                "sk": sk,
+                "region": item["region"],
+                "instance_id": item["instance_id"],
+                "traffic_limit_gb": limit,
+                "actions_enabled": actions_enabled,
+                "instance_log_enabled": False,
+                "paused": False,
+                "billing": dict(billing),
+                "schedule": dict(guard.DEFAULT_SCHEDULE),
+            }
+        )
+        existing.add(identity)
+        imported += 1
+    if imported:
+        save_config(config)
+    print("已导入 {} 台实例，重复实例已跳过。".format(imported))
 
 
 def show_status(config):
@@ -1316,7 +1737,7 @@ def menu():
         print(" 2) 立即执行一轮检测")
         print(" 3) 演练一轮（不执行开关机）")
         print(" 4) 测试 Telegram 通知")
-        print(" 5) Telegram 连接方式")
+        print(" 5) Telegram 连接与 Bot 控制")
         print(" 6) 查看监控实例")
         print(" 7) 添加监控实例")
         print(" 8) 编辑监控实例")
@@ -1331,8 +1752,11 @@ def menu():
         if update_info and update_info.get("available"):
             update_hint = "  " + yellow_text("[有新版本 v{}]".format(update_info["version"]))
         print("16) 更新 GitHub 版本{}".format(update_hint))
-        print("17) 退出")
-        choice = prompt_int("请输入序号", 1, 1, 17)
+        print("17) 备份、恢复与版本回滚")
+        print("18) 自动发现并批量导入 ECS")
+        print("19) 退出")
+        print("20) AWS S3 自动备份")
+        choice = prompt_int("请输入序号", 19, 1, 20)
         try:
             if choice == 1:
                 show_status(config)
@@ -1369,10 +1793,16 @@ def menu():
                 if update_from_github(release_info=update_info) is True:
                     return 0
             elif choice == 17:
+                backup_restore_menu()
+            elif choice == 18:
+                discover_instances_menu(config)
+            elif choice == 19:
                 return 0
+            elif choice == 20:
+                s3_backup_menu(config)
         except KeyboardInterrupt:
             print("\n操作已取消。")
-        if choice != 17:
+        if choice != 19:
             prompt("按回车返回菜单")
 
 

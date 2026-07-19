@@ -40,13 +40,15 @@ if [ "$(id -u)" -ne 0 ]; then
     die "请使用 root 权限运行（sudo -i）。"
 fi
 
-if [ ! -r /dev/tty ] && [ "$INSTALL_ACTION" = interactive ]; then
-    die "这是交互式安装器，但当前没有可用终端。请在 SSH/VNC 终端中运行。"
-fi
-if [ -r /dev/tty ]; then
+TTY_AVAILABLE=no
+if [ "$INSTALL_ACTION" = update ]; then
+    # Web/systemd updates are deliberately non-interactive and need no controlling terminal.
+    exec 3</dev/null
+elif { : </dev/tty; } 2>/dev/null; then
     exec 3</dev/tty
+    TTY_AVAILABLE=yes
 else
-    exec 3<&0
+    die "这是交互式安装器，但当前没有可用终端。请在 SSH/VNC 终端中运行。"
 fi
 
 prompt() {
@@ -306,7 +308,9 @@ create_venv() {
     "$VENV_DIR/bin/python" -m pip install --disable-pip-version-check \
         'aliyun-python-sdk-core>=2.16,<3' \
         'aliyun-python-sdk-ecs>=4.24,<5' \
-        'requests[socks]>=2.31,<3'
+        'requests[socks]>=2.31,<3' \
+        'cryptography>=42,<46' \
+        'boto3>=1.34,<2'
 }
 
 stop_old_backend() {
@@ -324,6 +328,1196 @@ stop_old_backend() {
 write_payload() {
     say "${YELLOW}[3/6] 写入程序文件...${RESET}"
     mkdir -p "$APP_DIR/logs"
+    cat > "$APP_DIR/backup_manager.py" <<'__AG_BACKUP_PY_EOF__'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Authenticated backups and local program rollback snapshots."""
+
+import base64
+import datetime as dt
+import hashlib
+import hmac
+import json
+import os
+from pathlib import Path
+import secrets
+import shutil
+import tarfile
+import tempfile
+
+try:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    CRYPTOGRAPHY_IMPORT_ERROR = None
+except ImportError as exc:
+    AESGCM = None
+    CRYPTOGRAPHY_IMPORT_ERROR = exc
+
+
+APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
+BACKUP_DIR = Path(os.environ.get("ALIYUN_GUARD_BACKUP_DIR", APP_DIR / "backups"))
+BACKUP_FORMAT = "aliyun-guard-backup-v1"
+SNAPSHOT_FORMAT = "aliyun-guard-program-v1"
+PBKDF2_ITERATIONS = 240000
+MAX_FILE_BYTES = 16 * 1024 * 1024
+MAX_BACKUP_BYTES = 64 * 1024 * 1024
+MAX_BACKUP_FILE_BYTES = 88 * 1024 * 1024
+
+DATA_FILES = (
+    "config.json",
+    "state.json",
+    "telegram-control-state.json",
+    "s3-backup-state.json",
+    "service_backend",
+)
+PROGRAM_FILES = (
+    "aliyun_guard.py",
+    "s3_backup.py",
+    "manager.py",
+    "telegram_proxy.py",
+    "telegram_control.py",
+    "web_actions.py",
+    "web_panel.py",
+    "web_panel.html",
+    "control.sh",
+    "uninstall.sh",
+    "version.json",
+)
+
+
+class BackupError(RuntimeError):
+    pass
+
+
+def _now_text():
+    return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _stamp():
+    return dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def _b64encode(value):
+    return base64.b64encode(value).decode("ascii")
+
+
+def _b64decode(value, label):
+    try:
+        return base64.b64decode(str(value).encode("ascii"), validate=True)
+    except Exception as exc:
+        raise BackupError("备份中的 {} 格式无效".format(label)) from exc
+
+
+def _derive_keys(passphrase, salt, iterations):
+    phrase = str(passphrase or "")
+    if len(phrase) < 8:
+        raise BackupError("备份密码至少需要 8 个字符")
+    return hashlib.pbkdf2_hmac(
+        "sha256", phrase.encode("utf-8"), salt, int(iterations), dklen=32
+    )
+
+
+def _require_cryptography():
+    if CRYPTOGRAPHY_IMPORT_ERROR is not None:
+        raise BackupError(
+            "缺少备份加密依赖 cryptography: {}".format(CRYPTOGRAPHY_IMPORT_ERROR)
+        )
+
+
+def encrypt_payload(payload, passphrase, iterations=PBKDF2_ITERATIONS):
+    _require_cryptography()
+    plaintext = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+    ).encode("utf-8")
+    if len(plaintext) > MAX_BACKUP_BYTES:
+        raise BackupError("备份内容超过 {} MiB 限制".format(MAX_BACKUP_BYTES // 1048576))
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(12)
+    encryption_key = _derive_keys(passphrase, salt, iterations)
+    associated_data = (
+        BACKUP_FORMAT.encode("ascii") + b"\0" + str(int(iterations)).encode("ascii")
+    )
+    ciphertext = AESGCM(encryption_key).encrypt(nonce, plaintext, associated_data)
+    return {
+        "format": BACKUP_FORMAT,
+        "created_at": _now_text(),
+        "kdf": "pbkdf2-hmac-sha256",
+        "cipher": "aes-256-gcm",
+        "iterations": int(iterations),
+        "salt": _b64encode(salt),
+        "nonce": _b64encode(nonce),
+        "ciphertext": _b64encode(ciphertext),
+    }
+
+
+def decrypt_payload(envelope, passphrase):
+    _require_cryptography()
+    if not isinstance(envelope, dict) or envelope.get("format") != BACKUP_FORMAT:
+        raise BackupError("不是受支持的 Aliyun Guard 备份")
+    try:
+        iterations = int(envelope.get("iterations"))
+    except (TypeError, ValueError) as exc:
+        raise BackupError("备份 KDF 参数无效") from exc
+    if iterations < 100000 or iterations > 2000000:
+        raise BackupError("备份 KDF 参数超出安全范围")
+    salt = _b64decode(envelope.get("salt", ""), "salt")
+    nonce = _b64decode(envelope.get("nonce", ""), "nonce")
+    ciphertext = _b64decode(envelope.get("ciphertext", ""), "ciphertext")
+    if len(ciphertext) > MAX_BACKUP_BYTES + 16:
+        raise BackupError("备份内容过大")
+    if envelope.get("cipher") != "aes-256-gcm":
+        raise BackupError("备份加密算法不受支持")
+    encryption_key = _derive_keys(passphrase, salt, iterations)
+    associated_data = BACKUP_FORMAT.encode("ascii") + b"\0" + str(iterations).encode("ascii")
+    try:
+        plaintext = AESGCM(encryption_key).decrypt(
+            nonce, ciphertext, associated_data
+        )
+    except Exception as exc:
+        raise BackupError("备份密码错误或文件已损坏") from exc
+    try:
+        payload = json.loads(plaintext.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise BackupError("备份解密后内容无效") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("files"), dict):
+        raise BackupError("备份内容结构无效")
+    return payload
+
+
+def _safe_relative_path(value):
+    text = str(value or "").replace("\\", "/").strip("/")
+    path = Path(text)
+    if (
+        not text
+        or path.is_absolute()
+        or ".." in path.parts
+        or text.startswith(".")
+    ):
+        raise BackupError("备份包含不安全路径")
+    allowed = text in DATA_FILES or text.startswith("logs/")
+    if not allowed:
+        raise BackupError("备份包含不允许恢复的文件: {}".format(text))
+    return text
+
+
+def _read_file(path):
+    size = path.stat().st_size
+    if size > MAX_FILE_BYTES:
+        raise BackupError("文件过大，未加入备份: {}".format(path.name))
+    return path.read_bytes()
+
+
+def collect_data_files(app_dir=APP_DIR, include_state=True, include_logs=True):
+    root = Path(app_dir)
+    files = {}
+    selected = ["config.json", "service_backend"]
+    if include_state:
+        selected.extend(("state.json", "telegram-control-state.json"))
+    for name in selected:
+        path = root / name
+        if path.is_file():
+            data = _read_file(path)
+            files[name] = {
+                "content": _b64encode(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "mode": int(path.stat().st_mode & 0o777),
+            }
+    if include_logs:
+        log_dir = root / "logs"
+        if log_dir.is_dir():
+            for path in sorted(log_dir.rglob("*")):
+                if not path.is_file():
+                    continue
+                relative = "logs/" + path.relative_to(log_dir).as_posix()
+                data = _read_file(path)
+                files[relative] = {
+                    "content": _b64encode(data),
+                    "sha256": hashlib.sha256(data).hexdigest(),
+                    "mode": int(path.stat().st_mode & 0o777),
+                }
+    return files
+
+
+def create_backup(
+    passphrase,
+    app_dir=APP_DIR,
+    output_path=None,
+    include_state=True,
+    include_logs=True,
+):
+    root = Path(app_dir)
+    files = collect_data_files(root, include_state, include_logs)
+    if "config.json" not in files:
+        raise BackupError("未找到 config.json，无法创建完整备份")
+    payload = {
+        "format": BACKUP_FORMAT,
+        "created_at": _now_text(),
+        "source": "Aliyun Guard",
+        "files": files,
+    }
+    envelope = encrypt_payload(payload, passphrase)
+    destination = Path(output_path) if output_path else root / "backups" / (
+        "aliyun-guard-{}.agbackup".format(_stamp())
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(
+        json.dumps(envelope, ensure_ascii=True, indent=2) + "\n", encoding="utf-8"
+    )
+    os.chmod(str(destination), 0o600)
+    return destination
+
+
+def load_backup(path, passphrase):
+    backup_path = Path(path)
+    try:
+        envelope = json.loads(backup_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise BackupError("无法读取备份: {}".format(exc)) from exc
+    return decrypt_payload(envelope, passphrase)
+
+
+def _config_summary(content):
+    try:
+        config = json.loads(content.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {"valid_json": False, "instances": 0, "nodes": 0}
+    users = config.get("users", []) if isinstance(config, dict) else []
+    telegram = config.get("telegram", {}) if isinstance(config, dict) else {}
+    nodes = telegram.get("node_urls", []) if isinstance(telegram, dict) else []
+    return {
+        "valid_json": isinstance(config, dict),
+        "instances": len(users) if isinstance(users, list) else 0,
+        "nodes": len(nodes) if isinstance(nodes, list) else 0,
+        "web_enabled": bool(
+            isinstance(config, dict)
+            and isinstance(config.get("web_panel"), dict)
+            and config["web_panel"].get("enabled")
+        ),
+    }
+
+
+def preview_restore(path, passphrase, app_dir=APP_DIR):
+    payload = load_backup(path, passphrase)
+    root = Path(app_dir)
+    changes = []
+    config_summary = None
+    for raw_name, metadata in sorted(payload["files"].items()):
+        name = _safe_relative_path(raw_name)
+        if not isinstance(metadata, dict):
+            raise BackupError("备份文件元数据无效")
+        data = _b64decode(metadata.get("content", ""), name)
+        expected = str(metadata.get("sha256", "")).lower()
+        if hashlib.sha256(data).hexdigest() != expected:
+            raise BackupError("备份内部校验失败: {}".format(name))
+        current = root / name
+        if not current.exists():
+            action = "add"
+        elif hashlib.sha256(current.read_bytes()).hexdigest() == expected:
+            action = "unchanged"
+        else:
+            action = "replace"
+        changes.append({"path": name, "action": action, "size": len(data)})
+        if name == "config.json":
+            config_summary = _config_summary(data)
+    return {
+        "created_at": payload.get("created_at"),
+        "files": changes,
+        "summary": config_summary or {},
+    }
+
+
+def restore_backup(path, passphrase, app_dir=APP_DIR, include_logs=True):
+    preview = preview_restore(path, passphrase, app_dir)
+    payload = load_backup(path, passphrase)
+    root = Path(app_dir)
+    config_entry = payload["files"].get("config.json")
+    if not isinstance(config_entry, dict):
+        raise BackupError("备份缺少 config.json")
+    try:
+        config_value = json.loads(
+            _b64decode(config_entry.get("content", ""), "config.json").decode(
+                "utf-8"
+            )
+        )
+        import aliyun_guard as guard
+
+        guard.validate_config(guard.deep_merge(guard.DEFAULT_CONFIG, config_value))
+    except BackupError:
+        raise
+    except Exception as exc:
+        raise BackupError("备份配置校验失败: {}".format(exc)) from exc
+    safety = create_backup(
+        passphrase,
+        root,
+        root / "backups" / "before-restore-{}.agbackup".format(_stamp()),
+        include_state=True,
+        include_logs=include_logs,
+    )
+    restored = []
+    for raw_name, metadata in sorted(payload["files"].items()):
+        name = _safe_relative_path(raw_name)
+        if name.startswith("logs/") and not include_logs:
+            continue
+        data = _b64decode(metadata.get("content", ""), name)
+        destination = root / name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_name(destination.name + ".restore.tmp")
+        temporary.write_bytes(data)
+        mode = int(metadata.get("mode", 0o600)) & 0o777
+        os.chmod(str(temporary), mode or 0o600)
+        os.replace(str(temporary), str(destination))
+        restored.append(name)
+    return {"preview": preview, "restored": restored, "safety_backup": str(safety)}
+
+
+def create_program_snapshot(app_dir=APP_DIR, version="unknown"):
+    root = Path(app_dir)
+    destination = root / "backups" / "program-{}-{}.tar.gz".format(
+        _stamp(), str(version or "unknown").replace("/", "-")
+    )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    existing = [name for name in PROGRAM_FILES if (root / name).is_file()]
+    if not existing:
+        raise BackupError("未找到可快照的程序文件")
+    manifest = {
+        "format": SNAPSHOT_FORMAT,
+        "created_at": _now_text(),
+        "version": str(version or "unknown"),
+        "files": existing,
+    }
+    with tarfile.open(str(destination), "w:gz") as archive:
+        for name in existing:
+            archive.add(str(root / name), arcname=name, recursive=False)
+        encoded = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
+        with tempfile.NamedTemporaryFile(delete=False) as handle:
+            handle.write(encoded)
+            manifest_path = Path(handle.name)
+        try:
+            archive.add(str(manifest_path), arcname="snapshot-manifest.json", recursive=False)
+        finally:
+            manifest_path.unlink(missing_ok=True)
+    os.chmod(str(destination), 0o600)
+    return destination
+
+
+def list_program_snapshots(backup_dir=None, app_dir=APP_DIR):
+    directory = Path(backup_dir) if backup_dir else Path(app_dir) / "backups"
+    if not directory.exists():
+        return []
+    return sorted(directory.glob("program-*.tar.gz"), reverse=True)
+
+
+def restore_program_snapshot(snapshot_path=None, app_dir=APP_DIR):
+    root = Path(app_dir)
+    snapshots = list_program_snapshots(app_dir=root)
+    snapshot_source = (
+        Path(snapshot_path) if snapshot_path else (snapshots[0] if snapshots else None)
+    )
+    if snapshot_source is None or not snapshot_source.is_file():
+        raise BackupError("没有可用的程序回滚快照")
+    try:
+        snapshot_source.resolve().relative_to((root / "backups").resolve())
+    except (OSError, ValueError) as exc:
+        raise BackupError("程序快照必须位于本机备份目录") from exc
+    with tempfile.TemporaryDirectory(prefix="aliyun-guard-rollback-") as directory:
+        staging = Path(directory)
+        try:
+            with tarfile.open(str(snapshot_source), "r:gz") as archive:
+                members = archive.getmembers()
+                allowed = set(PROGRAM_FILES) | {"snapshot-manifest.json"}
+                names = [member.name for member in members]
+                if (
+                    len(names) != len(set(names))
+                    or names.count("snapshot-manifest.json") != 1
+                    or any(
+                        member.name not in allowed
+                        or not member.isfile()
+                        or member.size > MAX_FILE_BYTES
+                        for member in members
+                    )
+                ):
+                    raise BackupError("程序快照包含不安全文件")
+                for member in members:
+                    member_source = archive.extractfile(member)
+                    if member_source is None:
+                        raise BackupError("程序快照文件无法读取")
+                    destination = staging / member.name
+                    with member_source, destination.open("wb") as handle:
+                        shutil.copyfileobj(member_source, handle)
+        except (OSError, tarfile.TarError) as exc:
+            raise BackupError("无法读取程序快照: {}".format(exc)) from exc
+        manifest_path = staging / "snapshot-manifest.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise BackupError("程序快照清单无效") from exc
+        if manifest.get("format") != SNAPSHOT_FORMAT:
+            raise BackupError("程序快照版本不受支持")
+        manifest_files = manifest.get("files")
+        if (
+            not isinstance(manifest_files, list)
+            or not manifest_files
+            or len(manifest_files) != len(set(manifest_files))
+            or any(
+                name not in PROGRAM_FILES or not (staging / name).is_file()
+                for name in manifest_files
+            )
+        ):
+            raise BackupError("程序快照文件列表无效")
+        current_snapshot = create_program_snapshot(root, "before-rollback")
+        restored = []
+        for name in manifest_files:
+            destination = root / name
+            temporary = destination.with_name(destination.name + ".rollback.tmp")
+            shutil.copy2(str(staging / name), str(temporary))
+            os.chmod(str(temporary), 0o755 if name.endswith(".sh") else 0o600)
+            os.replace(str(temporary), str(destination))
+            restored.append(name)
+    return {
+        "snapshot": str(snapshot_source),
+        "version": str(manifest.get("version", "unknown")),
+        "restored": restored,
+        "safety_snapshot": str(current_snapshot),
+    }
+__AG_BACKUP_PY_EOF__
+    cat > "$APP_DIR/s3_backup.py" <<'__AG_S3_BACKUP_PY_EOF__'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Encrypted backup storage for AWS S3 and S3-compatible services."""
+
+import contextlib
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import tempfile
+import urllib.parse
+
+import backup_manager
+
+try:
+    import boto3
+    from botocore.config import Config
+    from botocore.exceptions import BotoCoreError, ClientError
+    from boto3.s3.transfer import TransferConfig
+    BOTO_IMPORT_ERROR = None
+except ImportError as exc:  # pragma: no cover - installer supplies boto3
+    boto3 = None
+    Config = None
+    TransferConfig = None
+    BotoCoreError = ClientError = Exception
+    BOTO_IMPORT_ERROR = exc
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - deployed targets are Linux
+    fcntl = None
+
+
+DEFAULT_CONFIG = {
+    "enabled": False,
+    "bucket": "",
+    "region": "us-east-1",
+    "endpoint_url": "",
+    "addressing_style": "auto",
+    "prefix": "aliyun-guard",
+    "access_key_id": "",
+    "secret_access_key": "",
+    "session_token": "",
+    "backup_password": "",
+    "schedule": "daily",
+    "time": "03:00",
+    "weekday": 0,
+    "retention": 30,
+    "include_state": True,
+    "include_logs": False,
+    "notification_mode": "errors",
+    "server_side_encryption": "AES256",
+    "kms_key_id": "",
+}
+
+STATE_NAME = "s3-backup-state.json"
+LOCK_NAME = "s3-backup.lock"
+MAX_REMOTE_ITEMS = 5000
+RETRY_SECONDS = 15 * 60
+
+
+class S3BackupError(RuntimeError):
+    pass
+
+
+def normalized_config(value):
+    result = dict(DEFAULT_CONFIG)
+    if isinstance(value, dict):
+        result.update(value)
+    result["bucket"] = str(result.get("bucket", "") or "").strip()
+    result["region"] = str(result.get("region", "") or "us-east-1").strip()
+    result["endpoint_url"] = str(result.get("endpoint_url", "") or "").strip().rstrip("/")
+    result["prefix"] = str(result.get("prefix", "") or "aliyun-guard").strip().strip("/")
+    for field in ("access_key_id", "secret_access_key", "session_token", "backup_password", "kms_key_id"):
+        result[field] = str(result.get(field, "") or "").strip()
+    return result
+
+
+def validate_config(value, require_ready=None):
+    config = normalized_config(value)
+    for field in ("enabled", "include_state", "include_logs"):
+        if not isinstance(config.get(field), bool):
+            raise S3BackupError("s3_backup.{} 必须是布尔值".format(field))
+    if config["schedule"] not in ("hourly", "daily", "weekly"):
+        raise S3BackupError("S3 备份周期必须是 hourly、daily 或 weekly")
+    if not re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(config.get("time", ""))):
+        raise S3BackupError("S3 备份时间必须是 HH:MM")
+    try:
+        config["weekday"] = int(config.get("weekday", 0))
+        config["retention"] = int(config.get("retention", 30))
+    except (TypeError, ValueError) as exc:
+        raise S3BackupError("S3 星期和保留份数必须是整数") from exc
+    if config["weekday"] < 0 or config["weekday"] > 6:
+        raise S3BackupError("S3 每周备份日期必须在 0 到 6 之间")
+    if config["retention"] < 1 or config["retention"] > 365:
+        raise S3BackupError("S3 备份保留份数必须在 1 到 365 之间")
+    if config["notification_mode"] not in ("always", "errors", "none"):
+        raise S3BackupError("S3 通知模式必须是 always、errors 或 none")
+    if config["server_side_encryption"] not in ("", "AES256", "aws:kms"):
+        raise S3BackupError("S3 服务端加密必须是 AES256、aws:kms 或关闭")
+    if config["addressing_style"] not in ("auto", "path", "virtual"):
+        raise S3BackupError("S3 寻址方式必须是 auto、path 或 virtual")
+    if config["server_side_encryption"] == "aws:kms" and not config["kms_key_id"]:
+        raise S3BackupError("使用 SSE-KMS 时必须填写 KMS Key ID")
+    if bool(config["access_key_id"]) != bool(config["secret_access_key"]):
+        raise S3BackupError("S3 Access Key ID 和 Secret Access Key 必须同时填写或同时留空")
+    if config["session_token"] and not config["access_key_id"]:
+        raise S3BackupError("S3 Session Token 需要同时配置 Access Key")
+    if config["endpoint_url"]:
+        parsed = urllib.parse.urlsplit(config["endpoint_url"])
+        if parsed.scheme not in ("http", "https") or not parsed.netloc or parsed.username or parsed.password:
+            raise S3BackupError("S3 Endpoint 必须是无账号密码的 HTTP/HTTPS 地址")
+        if parsed.scheme == "http" and parsed.hostname not in (
+            "127.0.0.1",
+            "localhost",
+            "::1",
+        ):
+            raise S3BackupError("远程 S3 Endpoint 必须使用 HTTPS；HTTP 仅允许本机 MinIO")
+    if config["prefix"]:
+        if len(config["prefix"]) > 256 or any(part in (".", "..") for part in config["prefix"].split("/")):
+            raise S3BackupError("S3 对象前缀无效")
+    ready = config["enabled"] if require_ready is None else bool(require_ready)
+    if ready:
+        if not config["bucket"]:
+            raise S3BackupError("S3 Bucket 不能为空")
+        if not config["region"]:
+            raise S3BackupError("S3 Region 不能为空")
+        if len(config["backup_password"]) < 8:
+            raise S3BackupError("S3 自动备份密码至少需要 8 个字符")
+    return config
+
+
+def _require_boto3():
+    if BOTO_IMPORT_ERROR is not None:
+        raise S3BackupError("缺少 S3 依赖 boto3: {}".format(BOTO_IMPORT_ERROR))
+
+
+def create_client(value):
+    _require_boto3()
+    config = validate_config(value, require_ready=True)
+    kwargs = {
+        "service_name": "s3",
+        "region_name": config["region"],
+        "config": Config(
+            connect_timeout=10,
+            read_timeout=60,
+            retries={"max_attempts": 3, "mode": "standard"},
+            signature_version="s3v4",
+            s3={"addressing_style": config["addressing_style"]},
+        ),
+    }
+    if config["endpoint_url"]:
+        kwargs["endpoint_url"] = config["endpoint_url"]
+    if config["access_key_id"]:
+        kwargs["aws_access_key_id"] = config["access_key_id"]
+        kwargs["aws_secret_access_key"] = config["secret_access_key"]
+        if config["session_token"]:
+            kwargs["aws_session_token"] = config["session_token"]
+    return boto3.client(**kwargs)
+
+
+def _compact_error(exc, secrets=()):
+    if BOTO_IMPORT_ERROR is None and isinstance(exc, ClientError):
+        error = exc.response.get("Error", {})
+        text = "{}: {}".format(error.get("Code", "S3Error"), error.get("Message", str(exc)))
+    else:
+        text = str(exc)
+    for secret in secrets:
+        if secret:
+            text = text.replace(str(secret), "***")
+    return text.replace("\r", " ").replace("\n", " ")[:600]
+
+
+def _config_secrets(config):
+    return tuple(
+        config.get(field, "")
+        for field in ("access_key_id", "secret_access_key", "session_token", "backup_password")
+        if config.get(field, "")
+    )
+
+
+def _call(label, operation, secrets=()):
+    try:
+        return operation()
+    except (BotoCoreError, ClientError, OSError) as exc:
+        raise S3BackupError(
+            "{}失败: {}".format(label, _compact_error(exc, secrets=secrets))
+        ) from exc
+
+
+def object_prefix(value):
+    config = normalized_config(value)
+    return config["prefix"] + "/" if config["prefix"] else ""
+
+
+def test_connection(value):
+    config = validate_config(value, require_ready=True)
+    client = create_client(config)
+    started = dt.datetime.now().astimezone()
+    _call(
+        "S3 连接测试",
+        lambda: client.list_objects_v2(
+            Bucket=config["bucket"], Prefix=object_prefix(config), MaxKeys=1
+        ),
+        secrets=_config_secrets(config),
+    )
+    elapsed = (dt.datetime.now().astimezone() - started).total_seconds()
+    return {
+        "ok": True,
+        "bucket": config["bucket"],
+        "region": config["region"],
+        "endpoint": config["endpoint_url"] or "AWS S3",
+        "latency_ms": max(0, int(elapsed * 1000)),
+    }
+
+
+def _extra_args(config):
+    result = {
+        "ContentType": "application/json",
+        "Metadata": {"format": backup_manager.BACKUP_FORMAT},
+    }
+    encryption = config["server_side_encryption"]
+    if encryption:
+        result["ServerSideEncryption"] = encryption
+    if encryption == "aws:kms":
+        result["SSEKMSKeyId"] = config["kms_key_id"]
+    return result
+
+
+def list_backups(value, limit=100, client=None):
+    config = validate_config(value, require_ready=True)
+    client = client or create_client(config)
+    prefix = object_prefix(config)
+    items = []
+    token = None
+    while len(items) < MAX_REMOTE_ITEMS:
+        kwargs = {"Bucket": config["bucket"], "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+        response = _call(
+            "读取 S3 备份列表",
+            lambda kwargs=kwargs: client.list_objects_v2(**kwargs),
+            secrets=_config_secrets(config),
+        )
+        for item in response.get("Contents", []):
+            key = str(item.get("Key", ""))
+            name = key[len(prefix):] if key.startswith(prefix) else ""
+            if name and "/" not in name and key.endswith(".agbackup"):
+                modified = item.get("LastModified")
+                items.append(
+                    {
+                        "key": key,
+                        "name": name,
+                        "size": int(item.get("Size", 0)),
+                        "modified_at": modified.isoformat() if hasattr(modified, "isoformat") else str(modified or ""),
+                        "etag": str(item.get("ETag", "")).strip('"'),
+                    }
+                )
+        if not response.get("IsTruncated"):
+            break
+        token = response.get("NextContinuationToken")
+        if not token:
+            break
+    items.sort(key=lambda item: (item["modified_at"], item["key"]), reverse=True)
+    return items[: max(1, min(int(limit), MAX_REMOTE_ITEMS))]
+
+
+def prune_backups(value, client=None):
+    config = validate_config(value, require_ready=True)
+    client = client or create_client(config)
+    items = list_backups(config, limit=MAX_REMOTE_ITEMS, client=client)
+    expired = items[config["retention"] :]
+    for item in expired:
+        _call(
+            "清理旧 S3 备份",
+            lambda key=item["key"]: client.delete_object(Bucket=config["bucket"], Key=key),
+            secrets=_config_secrets(config),
+        )
+    return [item["key"] for item in expired]
+
+
+def prune_local_backups(app_dir, retention):
+    local_items = sorted(
+        (Path(app_dir) / "backups").glob("aliyun-guard-s3-*.agbackup"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    deleted = []
+    for expired in local_items[int(retention) :]:
+        expired.unlink(missing_ok=True)
+        deleted.append(str(expired))
+    return deleted
+
+
+def create_and_upload(value, app_dir, now=None):
+    config = validate_config(value, require_ready=True)
+    now = now or dt.datetime.now().astimezone()
+    stamp = now.strftime("%Y%m%d-%H%M%S-%f")
+    filename = "aliyun-guard-s3-{}.agbackup".format(stamp)
+    local_path = Path(app_dir) / "backups" / filename
+    backup_manager.create_backup(
+        config["backup_password"],
+        app_dir=Path(app_dir),
+        output_path=local_path,
+        include_state=config["include_state"],
+        include_logs=config["include_logs"],
+    )
+    client = create_client(config)
+    key = object_prefix(config) + filename
+    try:
+        _call(
+            "上传 S3 加密备份",
+            lambda: client.upload_file(
+                str(local_path),
+                config["bucket"],
+                key,
+                ExtraArgs=_extra_args(config),
+                Config=TransferConfig(
+                    multipart_threshold=backup_manager.MAX_BACKUP_FILE_BYTES + 1
+                ),
+            ),
+            secrets=_config_secrets(config),
+        )
+        deleted = prune_backups(config, client=client)
+    finally:
+        local_deleted = prune_local_backups(app_dir, config["retention"])
+    return {
+        "ok": True,
+        "key": key,
+        "filename": filename,
+        "size": local_path.stat().st_size,
+        "local_path": str(local_path),
+        "deleted": deleted,
+        "local_deleted": local_deleted,
+        "bucket": config["bucket"],
+    }
+
+
+def _validate_remote_key(value, key):
+    prefix = object_prefix(value)
+    key = str(key or "").strip()
+    name = key[len(prefix):] if key.startswith(prefix) else ""
+    if (
+        not name
+        or len(key) > 1024
+        or len(name) > 255
+        or "/" in name
+        or "\\" in name
+        or not name.endswith(".agbackup")
+    ):
+        raise S3BackupError("S3 备份对象不在当前配置前缀下")
+    return key, name
+
+
+def download_backup(value, key, app_dir):
+    config = validate_config(value, require_ready=True)
+    key, name = _validate_remote_key(config, key)
+    directory = Path(app_dir) / "backups"
+    directory.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=str(directory), prefix=".s3-download-", suffix=".agbackup", delete=False
+    ) as handle:
+        destination = Path(handle.name)
+    temporary = destination.with_name(destination.name + ".tmp")
+    client = create_client(config)
+    try:
+        metadata = _call(
+            "读取 S3 备份信息",
+            lambda: client.head_object(Bucket=config["bucket"], Key=key),
+            secrets=_config_secrets(config),
+        )
+        if int(metadata.get("ContentLength", 0)) > backup_manager.MAX_BACKUP_FILE_BYTES:
+            raise S3BackupError("S3 备份文件超过大小限制")
+        _call(
+            "下载 S3 加密备份",
+            lambda: client.download_file(config["bucket"], key, str(temporary)),
+            secrets=_config_secrets(config),
+        )
+        if temporary.stat().st_size > backup_manager.MAX_BACKUP_FILE_BYTES:
+            raise S3BackupError("S3 备份文件超过大小限制")
+        os.chmod(str(temporary), 0o600)
+        os.replace(str(temporary), str(destination))
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        temporary.unlink(missing_ok=True)
+    return destination
+
+
+def schedule_slot(value, now=None):
+    config = validate_config(value, require_ready=True)
+    now = now or dt.datetime.now().astimezone()
+    hour, minute = (int(part) for part in config["time"].split(":"))
+    if config["schedule"] == "hourly":
+        target = now.replace(minute=minute, second=0, microsecond=0)
+        return now.strftime("hourly:%Y%m%d%H") if now >= target else None
+    if config["schedule"] == "daily":
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return now.strftime("daily:%Y%m%d") if now >= target else None
+    week_start = (now - dt.timedelta(days=now.weekday())).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+    target = week_start + dt.timedelta(
+        days=config["weekday"], hours=hour, minutes=minute
+    )
+    return "weekly:{}".format(week_start.strftime("%Y%m%d")) if now >= target else None
+
+
+def _read_state(path):
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def read_status(app_dir):
+    return _read_state(Path(app_dir) / STATE_NAME)
+
+
+def _write_state(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.chmod(str(temporary), 0o600)
+    os.replace(str(temporary), str(path))
+
+
+@contextlib.contextmanager
+def backup_lock(app_dir):
+    path = Path(app_dir) / LOCK_NAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+")
+    locked = True
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            locked = False
+    try:
+        yield locked
+    finally:
+        if locked and fcntl is not None:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
+
+
+def run_if_due(value, app_dir, now=None):
+    config = validate_config(value, require_ready=False)
+    if not config["enabled"]:
+        return None
+    config = validate_config(config, require_ready=True)
+    now = now or dt.datetime.now().astimezone()
+    slot = schedule_slot(config, now)
+    if slot is None:
+        return None
+    state_path = Path(app_dir) / STATE_NAME
+    with backup_lock(app_dir) as locked:
+        if not locked:
+            return {"ok": True, "skipped": "locked", "slot": slot}
+        state = _read_state(state_path)
+        if state.get("last_success_slot") == slot:
+            return None
+        if state.get("last_attempt_slot") == slot:
+            try:
+                last_attempt = dt.datetime.fromisoformat(state["last_attempt_at"])
+                if (now - last_attempt).total_seconds() < RETRY_SECONDS:
+                    return None
+            except (KeyError, TypeError, ValueError):
+                pass
+        state.update(
+            {
+                "last_attempt_slot": slot,
+                "last_attempt_at": now.isoformat(timespec="seconds"),
+            }
+        )
+        _write_state(state_path, state)
+        try:
+            result = create_and_upload(config, app_dir, now=now)
+            state.update(
+                {
+                    "last_success_slot": slot,
+                    "last_success_at": now.isoformat(timespec="seconds"),
+                    "last_key": result["key"],
+                    "last_error": None,
+                }
+            )
+            result["slot"] = slot
+        except Exception as exc:
+            error = _compact_error(
+                exc,
+                secrets=(
+                    config["access_key_id"],
+                    config["secret_access_key"],
+                    config["session_token"],
+                    config["backup_password"],
+                ),
+            )
+            state["last_error"] = error
+            result = {"ok": False, "slot": slot, "error": error}
+        _write_state(state_path, state)
+        return result
+__AG_S3_BACKUP_PY_EOF__
+    cat > "$APP_DIR/watchdog.py" <<'__AG_WATCHDOG_PY_EOF__'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""External heartbeat watchdog for Aliyun Guard."""
+
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+
+APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
+HEARTBEAT_FILE = Path(
+    os.environ.get("ALIYUN_GUARD_HEARTBEAT", APP_DIR / "heartbeat.json")
+)
+WATCHDOG_STATE_FILE = Path(
+    os.environ.get("ALIYUN_GUARD_WATCHDOG_STATE", APP_DIR / "watchdog-state.json")
+)
+BACKEND_FILE = APP_DIR / "service_backend"
+DISABLED_FILE = APP_DIR / "disabled"
+SERVICE_NAME = "aliyun-guard"
+
+
+def _atomic_write(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(str(temporary), 0o600)
+    os.replace(str(temporary), str(path))
+
+
+def read_json(path):
+    try:
+        with Path(path).open("r", encoding="utf-8") as handle:
+            value = json.load(handle)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def heartbeat_age(now=None):
+    now = time.time() if now is None else float(now)
+    heartbeat = read_json(HEARTBEAT_FILE)
+    try:
+        epoch = float(heartbeat.get("epoch"))
+    except (TypeError, ValueError):
+        return None, heartbeat
+    return max(0.0, now - epoch), heartbeat
+
+
+def backend_name():
+    try:
+        return BACKEND_FILE.read_text(encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+def restart_backend(backend=None):
+    backend = backend or backend_name()
+    if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
+        return False, "Docker 容器由 restart policy 负责重启"
+    if backend == "systemd":
+        command = ["systemctl", "restart", SERVICE_NAME + ".service"]
+    elif backend == "openrc":
+        command = ["rc-service", SERVICE_NAME, "restart"]
+    else:
+        return False, "{} 后端不支持主动重启".format(backend)
+    try:
+        result = subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+        )
+    except Exception as exc:
+        return False, str(exc)
+    output = (result.stdout or "").strip()
+    return result.returncode == 0, output or "exit {}".format(result.returncode)
+
+
+def _notify(text):
+    import aliyun_guard as guard
+
+    config = guard.load_config()
+    telegram = config.get("telegram", {})
+    if not str(telegram.get("bot_token", "")).strip() or not str(
+        telegram.get("chat_id", "")
+    ).strip():
+        return "Telegram 未配置"
+    guard.send_telegram_message(telegram, text)
+    return None
+
+
+def has_valid_instance(config):
+    for user in config.get("users", []):
+        if not isinstance(user, dict):
+            continue
+        if all(
+            str(user.get(field, "") or "").strip()
+            for field in ("ak", "sk", "region", "instance_id")
+        ):
+            return True
+    return False
+
+
+def disabled_result(reason):
+    state = read_json(WATCHDOG_STATE_FILE)
+    state.update(
+        {
+            "checked_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "failed_checks": 0,
+            "outage_notified": False,
+            "last_status": "disabled",
+            "disabled_reason": reason,
+        }
+    )
+    _atomic_write(WATCHDOG_STATE_FILE, state)
+    return {"status": "disabled", "reason": reason, "failed_checks": 0}
+
+
+def check_once(now=None, restart=True, notify=True):
+    import aliyun_guard as guard
+
+    now = time.time() if now is None else float(now)
+    config = guard.load_config()
+    watchdog = config.get("watchdog", {})
+    if not isinstance(watchdog, dict) or not watchdog.get("enabled", True):
+        return disabled_result("watchdog_disabled")
+    if DISABLED_FILE.exists():
+        return disabled_result("service_paused")
+    if not has_valid_instance(config):
+        return disabled_result("no_valid_instances")
+    timeout_seconds = max(120, int(watchdog.get("timeout_seconds", 600)))
+    failure_threshold = max(1, int(watchdog.get("failure_threshold", 2)))
+    age, heartbeat = heartbeat_age(now)
+    state = read_json(WATCHDOG_STATE_FILE)
+    stale = age is None or age > timeout_seconds
+    failed = int(state.get("failed_checks", 0) or 0)
+    outage_notified = bool(state.get("outage_notified", False))
+    result = {
+        "status": "healthy",
+        "heartbeat_age_seconds": age,
+        "failed_checks": 0,
+        "last_heartbeat": heartbeat.get("at"),
+        "restart_attempted": False,
+        "restart_ok": None,
+        "notification_error": None,
+    }
+    if stale:
+        failed += 1
+        result["status"] = "stale"
+        result["failed_checks"] = failed
+        if failed >= failure_threshold:
+            result["status"] = "outage"
+            if restart:
+                result["restart_attempted"] = True
+                result["restart_ok"], result["restart_detail"] = restart_backend()
+            if notify and not outage_notified:
+                age_text = "尚未生成心跳" if age is None else "已失联 {:.0f} 秒".format(age)
+                try:
+                    result["notification_error"] = _notify(
+                        "Aliyun Guard 监控失联\n"
+                        "时间: {}\n"
+                        "状态: {}\n"
+                        "连续检查失败: {} 次\n"
+                        "自动重启: {}".format(
+                            dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                            age_text,
+                            failed,
+                            "成功" if result.get("restart_ok") else "未成功或不支持",
+                        )
+                    )
+                except Exception as exc:
+                    result["notification_error"] = guard.compact_error(exc)
+                outage_notified = True
+    else:
+        if outage_notified and notify:
+            try:
+                result["notification_error"] = _notify(
+                    "Aliyun Guard 监控已恢复\n"
+                    "时间: {}\n"
+                    "当前心跳延迟: {:.0f} 秒".format(
+                        dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S"),
+                        age,
+                    )
+                )
+            except Exception as exc:
+                result["notification_error"] = guard.compact_error(exc)
+            result["status"] = "recovered"
+        failed = 0
+        outage_notified = False
+    state.update(
+        {
+            "checked_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "failed_checks": failed,
+            "outage_notified": outage_notified,
+            "last_status": result["status"],
+            "last_heartbeat": heartbeat.get("at"),
+        }
+    )
+    _atomic_write(WATCHDOG_STATE_FILE, state)
+    return result
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Aliyun Guard 外部心跳看门狗")
+    parser.add_argument("--no-restart", action="store_true")
+    parser.add_argument("--no-notify", action="store_true")
+    args = parser.parse_args(argv)
+    try:
+        result = check_once(
+            restart=not args.no_restart, notify=not args.no_notify
+        )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 1 if result.get("status") == "outage" else 0
+    except Exception as exc:
+        print("看门狗检查失败: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+__AG_WATCHDOG_PY_EOF__
     cat > "$APP_DIR/telegram_proxy.py" <<'__AG_PROXY_PY_EOF__'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -905,21 +2099,1392 @@ def ensure_node_proxy(node_link, startup_timeout=12):
 
 atexit.register(stop_node_proxy)
 __AG_PROXY_PY_EOF__
+    cat > "$APP_DIR/telegram_control.py" <<'__AG_CONTROL_PY_EOF__'
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Secure Telegram command polling for Aliyun Guard."""
+
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import threading
+import time
+
+
+POLL_TIMEOUT_SECONDS = 20
+RETRY_WAIT_SECONDS = 5
+CONFIRM_TTL_SECONDS = 90
+SCHEDULE_INPUT_TTL_SECONDS = 300
+
+BOT_COMMANDS = [
+    {"command": "status", "description": "查看最近检测状态"},
+    {"command": "instances", "description": "查看监控实例"},
+    {"command": "check", "description": "立即执行一轮检测"},
+    {"command": "poweron", "description": "选择实例开机"},
+    {"command": "poweroff", "description": "选择实例关机"},
+    {"command": "schedule", "description": "管理定时开关机"},
+    {"command": "help", "description": "显示控制菜单"},
+]
+
+
+def _token_fingerprint(token):
+    return hashlib.sha256(str(token or "").encode("utf-8")).hexdigest()[:24]
+
+
+def _control_state_path(guard):
+    configured = os.environ.get("ALIYUN_GUARD_TELEGRAM_CONTROL_STATE")
+    if configured:
+        return Path(configured)
+    return guard.STATE_FILE.with_name("telegram-control-state.json")
+
+
+def _load_offset(guard, fingerprint):
+    path = _control_state_path(guard)
+    try:
+        data = guard.load_json(path, {})
+        if data.get("token_fingerprint") != fingerprint:
+            return None
+        offset = int(data.get("offset", 0))
+        return max(0, offset)
+    except Exception:
+        return None
+
+
+def _save_offset(guard, fingerprint, offset):
+    guard.atomic_write_json(
+        _control_state_path(guard),
+        {"token_fingerprint": fingerprint, "offset": max(0, int(offset))},
+        mode=0o600,
+    )
+
+
+def _format_traffic(value):
+    try:
+        return "{:.2f} GB".format(float(value))
+    except (TypeError, ValueError):
+        return "暂无"
+
+
+def build_status_text(guard, config=None, state=None):
+    config = config or guard.load_config()
+    state = state or guard.load_state()
+    finished = state.get("last_cycle_finished_at") or "尚未完成检测"
+    if state.get("last_cycle_finished_at"):
+        result = "正常" if state.get("last_cycle_ok") else "存在错误"
+    else:
+        result = "暂无"
+    lines = [
+        "Aliyun Guard 状态",
+        "最近检测: {}".format(finished),
+        "检测结果: {}".format(result),
+        "检测次数: {}".format(int(state.get("cycle_count", 0) or 0)),
+        "监控实例: {} 个".format(len(config.get("users", []))),
+    ]
+    telegram_error = str(state.get("telegram_error", "") or "").strip()
+    if telegram_error:
+        lines.append("通知状态: 上次发送失败")
+    return "\n".join(lines)
+
+
+def build_instances_text(guard, config=None, state=None):
+    config = config or guard.load_config()
+    state = state or guard.load_state()
+    previous = state.get("instances", {})
+    if not isinstance(previous, dict):
+        previous = {}
+    users = config.get("users", [])
+    if not users:
+        return "尚未配置监控实例。"
+    lines = ["监控实例"]
+    for index, user in enumerate(users, 1):
+        instance_id = str(user.get("instance_id", ""))
+        current = previous.get(instance_id, {})
+        if not isinstance(current, dict):
+            current = {}
+        status = current.get("status_after") or "Unknown"
+        mode = "已暂停" if user.get("paused") else "监控中"
+        lines.extend(
+            [
+                "",
+                "#{:d} {}".format(index, user.get("name") or instance_id),
+                "ID: {}".format(instance_id),
+                "状态: {} · {}".format(status, mode),
+                "流量: {} / {:.2f} GB".format(
+                    _format_traffic(current.get("traffic_gb")),
+                    float(user.get("traffic_limit_gb", 0) or 0),
+                ),
+            ]
+        )
+    return "\n".join(lines)
+
+
+def resolve_instance(config, selector):
+    users = config.get("users", [])
+    selector = str(selector or "").strip()
+    if selector.isdigit():
+        index = int(selector) - 1
+        if 0 <= index < len(users):
+            return users[index]
+    exact = [
+        user
+        for user in users
+        if selector
+        and selector.casefold()
+        in {
+            str(user.get("instance_id", "")).casefold(),
+            str(user.get("name", "")).casefold(),
+        }
+    ]
+    return exact[0] if len(exact) == 1 else None
+
+
+def build_schedule_text(guard, user, now=None):
+    now = now or dt.datetime.now().astimezone()
+    schedule = guard.get_schedule_config(user)
+    name = str(user.get("name") or user.get("instance_id", ""))
+    lines = [
+        "定时开关机",
+        "实例: {} ({})".format(name, user.get("instance_id", "")),
+        "服务器时间: {}".format(now.strftime("%Y-%m-%d %H:%M %Z%z")),
+        "计划状态: {}".format("已启用" if schedule["enabled"] else "已关闭"),
+        "每日开机: {}".format(schedule["start_time"]),
+        "每日关机: {}".format(schedule["stop_time"]),
+    ]
+    if schedule["enabled"]:
+        target = guard.schedule_target(user, now)
+        event = guard.next_schedule_event(user, now)
+        lines.append(
+            "运行时段: {}".format(
+                "跨午夜" if schedule["start_time"] > schedule["stop_time"] else "当日"
+            )
+        )
+        lines.append("当前目标: {}".format("运行" if target == "running" else "关机"))
+        if event:
+            event_time, action = event
+            lines.append(
+                "下一动作: {} {}".format(
+                    event_time.strftime("%Y-%m-%d %H:%M"),
+                    "开机" if action == "start" else "关机",
+                )
+            )
+    if user.get("paused"):
+        lines.append("提示: 实例监控已暂停，计划暂不执行。")
+    else:
+        lines.append("提示: 达到流量阈值时不会执行计划开机。")
+    return "\n".join(lines)
+
+
+class TelegramControlService:
+    def __init__(self, guard):
+        self.guard = guard
+        self.stop_event = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run,
+            name="aliyun-guard-telegram-control",
+            daemon=True,
+        )
+        self.pending = {}
+        self.schedule_inputs = {}
+        self.offset = None
+        self.fingerprint = None
+        self.commands_fingerprint = None
+        self.last_error = None
+        self.last_inactive_reason = None
+        self.drain_pending = True
+
+    def start(self):
+        self.thread.start()
+        return self
+
+    def shutdown(self):
+        self.stop_event.set()
+        self.thread.join(timeout=POLL_TIMEOUT_SECONDS + 5)
+
+    def _log_inactive(self, reason):
+        if reason != self.last_inactive_reason:
+            self.guard.LOGGER.info("Telegram Bot 控制未运行: %s", reason)
+            self.last_inactive_reason = reason
+
+    def _poll_config(self):
+        config = self.guard.load_config()
+        telegram = config.get("telegram", {})
+        if not telegram.get("control_enabled", True):
+            self.drain_pending = True
+            self._log_inactive("已在配置中关闭")
+            return None, None, None
+        if not str(telegram.get("bot_token", "") or "").strip():
+            self.drain_pending = True
+            self._log_inactive("Bot Token 未配置")
+            return None, None, None
+        admins = self.guard.telegram_control_admin_ids(telegram)
+        if not admins:
+            self.drain_pending = True
+            self._log_inactive("未配置有效的管理员用户 ID")
+            return None, None, None
+        self.last_inactive_reason = None
+        return config, telegram, set(admins)
+
+    def _telegram_api(self, telegram, method, data=None, long_poll=False):
+        candidate = dict(telegram)
+        if long_poll:
+            candidate["retries"] = 1
+        request_timeout = POLL_TIMEOUT_SECONDS + 10 if long_poll else None
+        return self.guard.telegram_api(
+            candidate,
+            method,
+            data or {},
+            request_timeout=request_timeout,
+        )
+
+    def _send(self, telegram, chat_id, text, reply_markup=None):
+        chunks = self.guard.split_message(str(text or ""))
+        result = None
+        for index, chunk in enumerate(chunks):
+            data = {"chat_id": str(chat_id), "text": chunk}
+            if reply_markup is not None and index == len(chunks) - 1:
+                data["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
+            result = self._telegram_api(telegram, "sendMessage", data)
+        return result
+
+    @staticmethod
+    def _callback_message_ref(callback):
+        message = callback.get("message", {}) if isinstance(callback, dict) else {}
+        chat_id = message.get("chat", {}).get("id")
+        message_id = message.get("message_id")
+        if chat_id is None or message_id is None:
+            return None, None
+        return int(chat_id), int(message_id)
+
+    def _edit(self, telegram, chat_id, message_id, text, reply_markup=None):
+        chunks = self.guard.split_message(str(text or ""))
+        if len(chunks) != 1:
+            return self._send(telegram, chat_id, text, reply_markup)
+        data = {
+            "chat_id": str(chat_id),
+            "message_id": str(message_id),
+            "text": chunks[0],
+            "reply_markup": json.dumps(
+                reply_markup or {"inline_keyboard": []}, ensure_ascii=False
+            ),
+        }
+        try:
+            return self._telegram_api(telegram, "editMessageText", data)
+        except Exception as exc:
+            detail = self.guard.compact_error(exc)
+            if "message is not modified" in detail.lower():
+                return None
+            self.guard.LOGGER.warning("Telegram 消息编辑失败，改为发送新消息: %s", detail)
+            return self._send(telegram, chat_id, text, reply_markup)
+
+    def _display(self, telegram, chat_id, text, reply_markup=None, message_id=None):
+        if message_id is not None:
+            return self._edit(
+                telegram, chat_id, message_id, text, reply_markup=reply_markup
+            )
+        return self._send(telegram, chat_id, text, reply_markup)
+
+    def _edit_callback(self, telegram, callback, text, reply_markup=None):
+        chat_id, message_id = self._callback_message_ref(callback)
+        if chat_id is None:
+            return None
+        return self._edit(
+            telegram, chat_id, message_id, text, reply_markup=reply_markup
+        )
+
+    def _answer_callback(self, telegram, callback_id, text="", alert=False):
+        data = {
+            "callback_query_id": str(callback_id),
+            "text": str(text or "")[:190],
+            "show_alert": "true" if alert else "false",
+        }
+        try:
+            self._telegram_api(telegram, "answerCallbackQuery", data)
+        except Exception as exc:
+            self.guard.LOGGER.warning("Telegram 回调确认失败: %s", self.guard.compact_error(exc))
+
+    def _close_menu(self, telegram, callback):
+        chat_id, message_id = self._callback_message_ref(callback)
+        if chat_id is None:
+            return None
+        try:
+            return self._telegram_api(
+                telegram,
+                "deleteMessage",
+                {"chat_id": str(chat_id), "message_id": str(message_id)},
+            )
+        except Exception as exc:
+            self.guard.LOGGER.warning(
+                "Telegram 菜单删除失败，改为收起按钮: %s",
+                self.guard.compact_error(exc),
+            )
+            return self._edit(
+                telegram,
+                chat_id,
+                message_id,
+                "Aliyun Guard Bot 菜单已关闭。\n\n发送 /help 可重新打开菜单。",
+            )
+
+    @staticmethod
+    def _menu_markup():
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "📊 状态", "callback_data": "ag:status"},
+                    {"text": "🖥 实例", "callback_data": "ag:instances"},
+                ],
+                [{"text": "🔍 立即检测", "callback_data": "ag:req:check"}],
+                [
+                    {"text": "▶ 实例开机", "callback_data": "ag:list:start"},
+                    {"text": "⏹ 实例关机", "callback_data": "ag:list:stop"},
+                ],
+                [{"text": "🕒 定时计划", "callback_data": "ag:schedule"}],
+                [{"text": "✖ 关闭菜单", "callback_data": "ag:close"}],
+            ]
+        }
+
+    @staticmethod
+    def _main_text():
+        return (
+            "Aliyun Guard Bot 控制\n\n"
+            "/status - 查看最近检测状态\n"
+            "/instances - 查看监控实例\n"
+            "/check - 立即执行一轮检测\n"
+            "/poweron <序号或实例ID> - 开机\n"
+            "/poweroff <序号或实例ID> - 关机\n"
+            "/schedule [序号或实例ID] - 定时计划\n"
+            "/help - 显示控制菜单\n\n"
+            "检测和关机需要确认；关机状态开机需要连续确认两次。"
+        )
+
+    @staticmethod
+    def _view_markup(refresh_data):
+        return {
+            "inline_keyboard": [
+                [
+                    {"text": "刷新", "callback_data": refresh_data},
+                    {"text": "返回主菜单", "callback_data": "ag:menu"},
+                ]
+            ]
+        }
+
+    def _send_help(self, telegram, chat_id, message_id=None):
+        self._display(
+            telegram,
+            chat_id,
+            self._main_text(),
+            self._menu_markup(),
+            message_id=message_id,
+        )
+
+    def _show_status(self, telegram, chat_id, config, message_id=None):
+        self._display(
+            telegram,
+            chat_id,
+            build_status_text(self.guard, config=config),
+            self._view_markup("ag:status"),
+            message_id=message_id,
+        )
+
+    def _show_instances(self, telegram, chat_id, config, message_id=None):
+        self._display(
+            telegram,
+            chat_id,
+            build_instances_text(self.guard, config=config),
+            self._view_markup("ag:instances"),
+            message_id=message_id,
+        )
+
+    def _instance_choices(self, telegram, chat_id, config, action, message_id=None):
+        label = "开机" if action == "start" else "关机"
+        rows = []
+        for index, user in enumerate(config.get("users", [])):
+            name = str(user.get("name") or user.get("instance_id"))[:32]
+            rows.append(
+                [
+                    {
+                        "text": "{} {}".format(label, name),
+                        "callback_data": "ag:req:{}:{}".format(action, index),
+                    }
+                ]
+            )
+        if not rows:
+            self._display(
+                telegram,
+                chat_id,
+                "尚未配置监控实例。",
+                self._view_markup("ag:list:{}".format(action)),
+                message_id=message_id,
+            )
+            return
+        rows.append([{"text": "返回主菜单", "callback_data": "ag:menu"}])
+        self._display(
+            telegram,
+            chat_id,
+            "请选择需要{}的实例：".format(label),
+            {"inline_keyboard": rows},
+            message_id=message_id,
+        )
+
+    def _schedule_choices(self, telegram, chat_id, config, message_id=None):
+        rows = []
+        for index, user in enumerate(config.get("users", [])):
+            schedule = self.guard.get_schedule_config(user)
+            name = str(user.get("name") or user.get("instance_id"))[:24]
+            suffix = (
+                "{}-{}".format(schedule["start_time"], schedule["stop_time"])
+                if schedule["enabled"]
+                else "已关闭"
+            )
+            rows.append(
+                [
+                    {
+                        "text": "{} · {}".format(name, suffix),
+                        "callback_data": "ag:sched:view:{}".format(index),
+                    }
+                ]
+            )
+        rows.append([{"text": "返回主菜单", "callback_data": "ag:menu"}])
+        text = "请选择需要管理定时计划的实例："
+        if not config.get("users", []):
+            text = "尚未配置监控实例。"
+        self._display(
+            telegram,
+            chat_id,
+            text,
+            {"inline_keyboard": rows},
+            message_id=message_id,
+        )
+
+    def _schedule_detail(self, telegram, chat_id, config, index, message_id=None):
+        users = config.get("users", [])
+        if index < 0 or index >= len(users):
+            self._display(
+                telegram,
+                chat_id,
+                "实例不存在或配置已经变化。",
+                self._view_markup("ag:schedule"),
+                message_id=message_id,
+            )
+            return
+        user = users[index]
+        schedule = self.guard.get_schedule_config(user)
+        toggle_label = "关闭计划" if schedule["enabled"] else "启用计划"
+        markup = {
+            "inline_keyboard": [
+                [
+                    {
+                        "text": "修改时间",
+                        "callback_data": "ag:sched:edit:{}".format(index),
+                    },
+                    {
+                        "text": toggle_label,
+                        "callback_data": "ag:sched:ask:{}".format(index),
+                    },
+                ],
+                [
+                    {
+                        "text": "刷新",
+                        "callback_data": "ag:sched:view:{}".format(index),
+                    },
+                    {"text": "返回实例列表", "callback_data": "ag:schedule"},
+                ],
+                [{"text": "返回主菜单", "callback_data": "ag:menu"}],
+            ]
+        }
+        self._display(
+            telegram,
+            chat_id,
+            build_schedule_text(self.guard, user),
+            markup,
+            message_id=message_id,
+        )
+
+    def _new_confirmation(
+        self,
+        telegram,
+        chat_id,
+        user_id,
+        action,
+        instance_id=None,
+        stage=1,
+        threshold_override=False,
+        traffic_gb=None,
+        limit_gb=None,
+        message_id=None,
+    ):
+        self._expire_pending()
+        self.pending = {
+            token: item
+            for token, item in self.pending.items()
+            if item.get("user_id") != int(user_id)
+        }
+        token = secrets.token_urlsafe(9)
+        self.pending[token] = {
+            "user_id": int(user_id),
+            "chat_id": int(chat_id),
+            "action": action,
+            "instance_id": instance_id,
+            "stage": int(stage),
+            "threshold_override": bool(threshold_override),
+            "message_id": message_id,
+            "expires": time.monotonic() + CONFIRM_TTL_SECONDS,
+        }
+        if action == "check":
+            text = "确认立即执行一轮真实检测？检测可能根据当前规则执行开关机。"
+        else:
+            config = self.guard.load_config()
+            user = next(
+                (
+                    item
+                    for item in config.get("users", [])
+                    if str(item.get("instance_id", "")) == str(instance_id)
+                ),
+                None,
+            )
+            if user is None:
+                self.pending.pop(token, None)
+                self._display(
+                    telegram,
+                    chat_id,
+                    "实例不存在或配置已经变化。",
+                    self._menu_markup(),
+                    message_id=message_id,
+                )
+                return
+            label = "开机" if action == "start" else "关机"
+            if action == "start" and int(stage) == 1:
+                text = "第一次确认：准备{}实例 {}（{}）？".format(
+                    label,
+                    user.get("name") or instance_id,
+                    instance_id,
+                )
+            elif action == "start" and threshold_override:
+                text = (
+                    "第二次确认：当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值。\n"
+                    "继续将强制开机，并自动暂停该实例监控。"
+                ).format(float(traffic_gb), float(limit_gb))
+            elif action == "start":
+                text = "第二次确认：实例当前已关机，确认执行开机？"
+            else:
+                text = "确认{}实例 {}（{}）？".format(
+                    label,
+                    user.get("name") or instance_id,
+                    instance_id,
+                )
+        markup = {
+            "inline_keyboard": [
+                [
+                    {"text": "确认执行", "callback_data": "ag:confirm:{}".format(token)},
+                    {"text": "取消", "callback_data": "ag:cancel:{}".format(token)},
+                ]
+            ]
+        }
+        self._display(
+            telegram,
+            chat_id,
+            text,
+            markup,
+            message_id=message_id,
+        )
+
+    def _expire_pending(self):
+        now = time.monotonic()
+        self.pending = {
+            token: item
+            for token, item in self.pending.items()
+            if float(item.get("expires", 0)) > now
+        }
+
+    def _prompt_schedule_input(
+        self, telegram, chat_id, user_id, config, index, message_id
+    ):
+        users = config.get("users", [])
+        if index < 0 or index >= len(users):
+            self._display(
+                telegram,
+                chat_id,
+                "实例不存在或配置已经变化。",
+                self._view_markup("ag:schedule"),
+                message_id=message_id,
+            )
+            return
+        user = users[index]
+        schedule = self.guard.get_schedule_config(user)
+        self.schedule_inputs[int(user_id)] = {
+            "chat_id": int(chat_id),
+            "message_id": int(message_id),
+            "instance_id": str(user.get("instance_id", "")),
+            "expires": time.monotonic() + SCHEDULE_INPUT_TTL_SECONDS,
+        }
+        text = (
+            "修改定时计划\n\n"
+            "实例: {} ({})\n"
+            "当前时间: {} 开机，{} 关机\n\n"
+            "请发送新的开机和关机时间：\n"
+            "格式: HH:MM HH:MM\n"
+            "示例: 08:30 23:15\n\n"
+            "输入有效期 5 分钟。"
+        ).format(
+            user.get("name") or user.get("instance_id"),
+            user.get("instance_id", ""),
+            schedule["start_time"],
+            schedule["stop_time"],
+        )
+        self._display(
+            telegram,
+            chat_id,
+            text,
+            {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "取消修改",
+                            "callback_data": "ag:sched:view:{}".format(index),
+                        }
+                    ]
+                ]
+            },
+            message_id=message_id,
+        )
+
+    def _handle_schedule_input(self, telegram, user_id, chat_id, text):
+        pending = self.schedule_inputs.get(int(user_id))
+        if pending is None or pending.get("chat_id") != int(chat_id):
+            return False
+        if float(pending.get("expires", 0)) <= time.monotonic():
+            self.schedule_inputs.pop(int(user_id), None)
+            self._display(
+                telegram,
+                chat_id,
+                "时间输入已过期，请重新进入定时计划修改。",
+                self._view_markup("ag:schedule"),
+                message_id=pending.get("message_id"),
+            )
+            return True
+        if text.startswith("/") and text.lower() != "/cancel":
+            self.schedule_inputs.pop(int(user_id), None)
+            return False
+        message_id = pending.get("message_id")
+        instance_id = str(pending.get("instance_id", ""))
+        if text.lower() == "/cancel":
+            self.schedule_inputs.pop(int(user_id), None)
+            config = self.guard.load_config()
+            index = next(
+                (
+                    index
+                    for index, user in enumerate(config.get("users", []))
+                    if str(user.get("instance_id", "")) == instance_id
+                ),
+                -1,
+            )
+            self._schedule_detail(
+                telegram, chat_id, config, index, message_id=message_id
+            )
+            return True
+        try:
+            parts = text.replace(",", " ").split()
+            if len(parts) != 2:
+                raise self.guard.GuardError("请同时输入开机时间和关机时间")
+            start_time = self.guard.normalize_schedule_time(parts[0], "开机时间")
+            stop_time = self.guard.normalize_schedule_time(parts[1], "关机时间")
+            if start_time == stop_time:
+                raise self.guard.GuardError("开机时间和关机时间不能相同")
+            with self.guard.cycle_lock() as locked:
+                if not locked:
+                    raise self.guard.GuardError("检测任务正在运行，请稍后重新输入")
+                config = self.guard.load_config()
+                index = next(
+                    (
+                        index
+                        for index, user in enumerate(config.get("users", []))
+                        if str(user.get("instance_id", "")) == instance_id
+                    ),
+                    None,
+                )
+                if index is None:
+                    raise self.guard.GuardError("实例不存在或配置已经变化")
+                user = config["users"][index]
+                schedule = self.guard.get_schedule_config(user)
+                user["schedule"] = {
+                    "enabled": bool(schedule["enabled"]),
+                    "start_time": start_time,
+                    "stop_time": stop_time,
+                }
+                self.guard.validate_config(config)
+                self.guard.atomic_write_json(self.guard.CONFIG_FILE, config, mode=0o600)
+            self.schedule_inputs.pop(int(user_id), None)
+            self.guard.LOGGER.info(
+                "Telegram 管理员 %s 修改实例 %s 定时计划为 %s-%s",
+                user_id,
+                instance_id,
+                start_time,
+                stop_time,
+            )
+            self._schedule_detail(
+                telegram, chat_id, config, index, message_id=message_id
+            )
+        except Exception as exc:
+            detail = self.guard.compact_error(exc)
+            self._display(
+                telegram,
+                chat_id,
+                "定时计划保存失败: {}\n\n请重新发送，例如：08:30 23:15".format(
+                    detail
+                ),
+                {
+                    "inline_keyboard": [
+                        [{"text": "取消修改", "callback_data": "ag:schedule"}]
+                    ]
+                },
+                message_id=message_id,
+            )
+        return True
+
+    def _confirm_schedule_toggle(
+        self, telegram, chat_id, config, index, message_id=None
+    ):
+        users = config.get("users", [])
+        if index < 0 or index >= len(users):
+            self._schedule_choices(
+                telegram, chat_id, config, message_id=message_id
+            )
+            return
+        user = users[index]
+        schedule = self.guard.get_schedule_config(user)
+        enabled = not schedule["enabled"]
+        action = "启用" if enabled else "关闭"
+        effect = (
+            "启用后，后台会在 1 分钟内按当前时段执行计划。"
+            if enabled
+            else "关闭后不会立即改变实例当前状态。"
+        )
+        text = (
+            "确认{}定时计划？\n\n"
+            "实例: {} ({})\n"
+            "每日开机: {}\n"
+            "每日关机: {}\n\n{}"
+        ).format(
+            action,
+            user.get("name") or user.get("instance_id"),
+            user.get("instance_id", ""),
+            schedule["start_time"],
+            schedule["stop_time"],
+            effect,
+        )
+        self._display(
+            telegram,
+            chat_id,
+            text,
+            {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": "确认{}".format(action),
+                            "callback_data": "ag:sched:set:{}:{}".format(
+                                index, 1 if enabled else 0
+                            ),
+                        },
+                        {
+                            "text": "取消",
+                            "callback_data": "ag:sched:view:{}".format(index),
+                        },
+                    ]
+                ]
+            },
+            message_id=message_id,
+        )
+
+    def _set_schedule_enabled(
+        self, telegram, chat_id, user_id, index, enabled, message_id=None
+    ):
+        with self.guard.cycle_lock() as locked:
+            if not locked:
+                raise self.guard.GuardError("检测任务正在运行，请稍后再试")
+            config = self.guard.load_config()
+            users = config.get("users", [])
+            if index < 0 or index >= len(users):
+                raise self.guard.GuardError("实例不存在或配置已经变化")
+            user = users[index]
+            schedule = self.guard.get_schedule_config(user)
+            user["schedule"] = {
+                "enabled": bool(enabled),
+                "start_time": schedule["start_time"],
+                "stop_time": schedule["stop_time"],
+            }
+            self.guard.validate_config(config)
+            self.guard.atomic_write_json(self.guard.CONFIG_FILE, config, mode=0o600)
+        self.guard.LOGGER.info(
+            "Telegram 管理员 %s %s实例 %s 定时计划",
+            user_id,
+            "启用" if enabled else "关闭",
+            user.get("instance_id", ""),
+        )
+        self._schedule_detail(
+            telegram, chat_id, config, index, message_id=message_id
+        )
+
+    def _authorized(self, telegram, admins, source, callback_id=None):
+        user_id = source.get("from", {}).get("id")
+        chat = source.get("chat")
+        if chat is None:
+            chat = source.get("message", {}).get("chat", {})
+        chat_id = chat.get("id")
+        if chat.get("type") != "private":
+            self.guard.LOGGER.warning("Telegram Bot 控制忽略非私聊命令: %s", chat_id)
+            if callback_id:
+                self._answer_callback(telegram, callback_id, "仅支持私聊", alert=True)
+            return None
+        if user_id not in admins:
+            self.guard.LOGGER.warning("Telegram Bot 控制拒绝未授权用户: %s", user_id)
+            if callback_id:
+                self._answer_callback(telegram, callback_id, "无权限", alert=True)
+            elif chat_id is not None:
+                self._send(telegram, chat_id, "无权限。")
+            return None
+        return int(user_id), int(chat_id)
+
+    def _handle_message(self, config, telegram, admins, message):
+        auth = self._authorized(telegram, admins, message)
+        if auth is None:
+            return
+        user_id, chat_id = auth
+        text = str(message.get("text", "") or "").strip()
+        if self._handle_schedule_input(telegram, user_id, chat_id, text):
+            return
+        if not text.startswith("/"):
+            self._send_help(telegram, chat_id)
+            return
+        parts = text.split()
+        command = parts[0].split("@", 1)[0].lower()
+        argument = " ".join(parts[1:]).strip()
+        if command in ("/start", "/help", "/menu"):
+            self._send_help(telegram, chat_id)
+        elif command == "/status":
+            self._show_status(telegram, chat_id, config)
+        elif command in ("/instances", "/list"):
+            self._show_instances(telegram, chat_id, config)
+        elif command == "/check":
+            self._new_confirmation(telegram, chat_id, user_id, "check")
+        elif command in ("/schedule", "/plan"):
+            if not argument:
+                self._schedule_choices(telegram, chat_id, config)
+                return
+            user = resolve_instance(config, argument)
+            if user is None:
+                self._send(
+                    telegram,
+                    chat_id,
+                    "实例不存在，请使用 /instances 查看序号。",
+                    self._view_markup("ag:schedule"),
+                )
+                return
+            index = config.get("users", []).index(user)
+            self._schedule_detail(telegram, chat_id, config, index)
+        elif command in ("/poweron", "/on", "/poweroff", "/off"):
+            action = "start" if command in ("/poweron", "/on") else "stop"
+            if not argument:
+                self._instance_choices(telegram, chat_id, config, action)
+                return
+            user = resolve_instance(config, argument)
+            if user is None:
+                self._send(telegram, chat_id, "实例不存在，请使用 /instances 查看序号。")
+                return
+            self._new_confirmation(
+                telegram,
+                chat_id,
+                user_id,
+                action,
+                str(user.get("instance_id", "")),
+            )
+        else:
+            self._send_help(telegram, chat_id)
+
+    def _execute_pending(self, telegram, pending):
+        chat_id = pending["chat_id"]
+        user_id = pending["user_id"]
+        action = pending["action"]
+        message_id = pending.get("message_id")
+        if action == "check":
+            self._display(
+                telegram,
+                chat_id,
+                "正在执行检测，请稍候。",
+                message_id=message_id,
+            )
+            with self.guard.cycle_lock() as locked:
+                if not locked:
+                    self._display(
+                        telegram,
+                        chat_id,
+                        "已有检测任务正在运行，请稍后再试。",
+                        self._menu_markup(),
+                        message_id=message_id,
+                    )
+                    return
+                code = self.guard.run_cycle(no_notify=True)
+                summary = str(self.guard.load_state().get("last_summary", "") or "")
+            self._display(
+                telegram,
+                chat_id,
+                summary or "检测已完成，返回状态码 {}。".format(code),
+                self._menu_markup(),
+                message_id=message_id,
+            )
+            self.guard.LOGGER.info("Telegram 管理员 %s 执行了一轮检测", user_id)
+            return
+
+        if action == "start" and int(pending.get("stage", 1)) == 1:
+            self._prepare_second_start_confirmation(telegram, pending)
+            return
+
+        config = self.guard.load_config()
+        instance_id = str(pending.get("instance_id", ""))
+        index = next(
+            (
+                index
+                for index, user in enumerate(config.get("users", []))
+                if str(user.get("instance_id", "")) == instance_id
+            ),
+            None,
+        )
+        if index is None:
+            self._display(
+                telegram,
+                chat_id,
+                "实例不存在或配置已经变化。",
+                self._menu_markup(),
+                message_id=message_id,
+            )
+            return
+        import web_panel
+
+        self.guard.LOGGER.info(
+            "Telegram 管理员 %s 请求%s实例 %s",
+            user_id,
+            "启动" if action == "start" else "停止",
+            instance_id,
+        )
+        self._display(
+            telegram,
+            chat_id,
+            "正在{}实例 {}，请稍候。".format(
+                "启动" if action == "start" else "停止", instance_id
+            ),
+            message_id=message_id,
+        )
+        result = web_panel.control_instance(
+            self.guard,
+            index,
+            action,
+            source="Telegram Bot",
+            notify=False,
+            allow_threshold_override=bool(pending.get("threshold_override", False)),
+            pause_on_threshold_override=True,
+        )
+        self._display(
+            telegram,
+            chat_id,
+            result["message"],
+            self._menu_markup(),
+            message_id=message_id,
+        )
+
+    def _prepare_second_start_confirmation(self, telegram, pending):
+        chat_id = pending["chat_id"]
+        user_id = pending["user_id"]
+        instance_id = str(pending.get("instance_id", ""))
+        message_id = pending.get("message_id")
+        with self.guard.cycle_lock() as locked:
+            if not locked:
+                self._display(
+                    telegram,
+                    chat_id,
+                    "已有检测任务正在运行，请稍后重新操作。",
+                    self._menu_markup(),
+                    message_id=message_id,
+                )
+                return
+            config = self.guard.load_config()
+            user = next(
+                (
+                    item
+                    for item in config.get("users", [])
+                    if str(item.get("instance_id", "")) == instance_id
+                ),
+                None,
+            )
+            if user is None:
+                self._display(
+                    telegram,
+                    chat_id,
+                    "实例不存在或配置已经变化。",
+                    self._menu_markup(),
+                    message_id=message_id,
+                )
+                return
+            status = self.guard.query_instance_status(user)
+            if status == "Running":
+                self._display(
+                    telegram,
+                    chat_id,
+                    "实例已经处于运行状态，无需开机。",
+                    self._menu_markup(),
+                    message_id=message_id,
+                )
+                return
+            if status != "Stopped":
+                self._display(
+                    telegram,
+                    chat_id,
+                    "实例当前状态为 {}，暂不执行开机。".format(status),
+                    self._menu_markup(),
+                    message_id=message_id,
+                )
+                return
+            traffic = self.guard.query_cdt_traffic_gb(user)
+            limit = float(user.get("traffic_limit_gb", 0) or 0)
+        self._new_confirmation(
+            telegram,
+            chat_id,
+            user_id,
+            "start",
+            instance_id,
+            stage=2,
+            threshold_override=traffic >= limit,
+            traffic_gb=traffic,
+            limit_gb=limit,
+            message_id=message_id,
+        )
+
+    def _handle_callback(self, config, telegram, admins, callback):
+        callback_id = callback.get("id")
+        auth = self._authorized(telegram, admins, callback, callback_id=callback_id)
+        if auth is None:
+            return
+        user_id, chat_id = auth
+        _callback_chat_id, message_id = self._callback_message_ref(callback)
+        data = str(callback.get("data", "") or "")
+        self.schedule_inputs.pop(int(user_id), None)
+        if not data.startswith(("ag:confirm:", "ag:cancel:")):
+            self.pending = {
+                token: item
+                for token, item in self.pending.items()
+                if item.get("user_id") != int(user_id)
+            }
+        if data == "ag:menu":
+            self._answer_callback(telegram, callback_id)
+            self._send_help(telegram, chat_id, message_id=message_id)
+            return
+        if data == "ag:close":
+            self._answer_callback(telegram, callback_id, "菜单已关闭")
+            self._close_menu(telegram, callback)
+            return
+        if data == "ag:status":
+            self._answer_callback(telegram, callback_id)
+            self._show_status(telegram, chat_id, config, message_id=message_id)
+            return
+        if data == "ag:instances":
+            self._answer_callback(telegram, callback_id)
+            self._show_instances(telegram, chat_id, config, message_id=message_id)
+            return
+        if data == "ag:schedule":
+            self._answer_callback(telegram, callback_id)
+            self._schedule_choices(telegram, chat_id, config, message_id=message_id)
+            return
+        if data.startswith("ag:sched:view:"):
+            try:
+                index = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                self._answer_callback(telegram, callback_id, "实例序号无效", alert=True)
+                return
+            self._answer_callback(telegram, callback_id)
+            self._schedule_detail(
+                telegram, chat_id, config, index, message_id=message_id
+            )
+            return
+        if data.startswith("ag:sched:edit:"):
+            try:
+                index = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                self._answer_callback(telegram, callback_id, "实例序号无效", alert=True)
+                return
+            self._answer_callback(telegram, callback_id)
+            self._prompt_schedule_input(
+                telegram, chat_id, user_id, config, index, message_id
+            )
+            return
+        if data.startswith("ag:sched:ask:"):
+            try:
+                index = int(data.rsplit(":", 1)[-1])
+            except ValueError:
+                self._answer_callback(telegram, callback_id, "实例序号无效", alert=True)
+                return
+            self._answer_callback(telegram, callback_id)
+            self._confirm_schedule_toggle(
+                telegram, chat_id, config, index, message_id=message_id
+            )
+            return
+        if data.startswith("ag:sched:set:"):
+            parts = data.split(":")
+            if len(parts) != 5 or parts[4] not in ("0", "1"):
+                self._answer_callback(telegram, callback_id, "计划操作无效", alert=True)
+                return
+            try:
+                index = int(parts[3])
+            except ValueError:
+                self._answer_callback(telegram, callback_id, "实例序号无效", alert=True)
+                return
+            self._answer_callback(telegram, callback_id, "正在保存")
+            try:
+                self._set_schedule_enabled(
+                    telegram,
+                    chat_id,
+                    user_id,
+                    index,
+                    parts[4] == "1",
+                    message_id=message_id,
+                )
+            except Exception as exc:
+                detail = self.guard.compact_error(exc)
+                self._display(
+                    telegram,
+                    chat_id,
+                    "定时计划保存失败: {}".format(detail),
+                    self._view_markup("ag:schedule"),
+                    message_id=message_id,
+                )
+            return
+        if data == "ag:req:check":
+            self._answer_callback(telegram, callback_id)
+            self._new_confirmation(
+                telegram,
+                chat_id,
+                user_id,
+                "check",
+                message_id=message_id,
+            )
+            return
+        if data.startswith("ag:list:"):
+            action = data.rsplit(":", 1)[-1]
+            self._answer_callback(telegram, callback_id)
+            if action in ("start", "stop"):
+                self._instance_choices(
+                    telegram, chat_id, config, action, message_id=message_id
+                )
+            return
+        if data.startswith("ag:req:"):
+            parts = data.split(":", 3)
+            self._answer_callback(telegram, callback_id)
+            if len(parts) == 4 and parts[2] in ("start", "stop"):
+                try:
+                    index = int(parts[3])
+                    if index < 0:
+                        raise IndexError
+                    user = config.get("users", [])[index]
+                except (IndexError, TypeError, ValueError):
+                    self._display(
+                        telegram,
+                        chat_id,
+                        "实例不存在或配置已经变化。",
+                        self._menu_markup(),
+                        message_id=message_id,
+                    )
+                    return
+                self._new_confirmation(
+                    telegram,
+                    chat_id,
+                    user_id,
+                    parts[2],
+                    str(user.get("instance_id", "")),
+                    message_id=message_id,
+                )
+            return
+        if data.startswith("ag:cancel:"):
+            token = data.split(":", 2)[-1]
+            pending = self.pending.get(token)
+            if pending and pending.get("user_id") == user_id:
+                self.pending.pop(token, None)
+                self._answer_callback(telegram, callback_id, "已取消")
+                self._send_help(telegram, chat_id, message_id=message_id)
+            else:
+                self._answer_callback(telegram, callback_id, "操作已失效", alert=True)
+            return
+        if data.startswith("ag:confirm:"):
+            token = data.split(":", 2)[-1]
+            self._expire_pending()
+            pending = self.pending.get(token)
+            if (
+                pending is None
+                or pending.get("user_id") != user_id
+                or pending.get("chat_id") != chat_id
+            ):
+                self._answer_callback(telegram, callback_id, "确认已过期或无效", alert=True)
+                return
+            self.pending.pop(token, None)
+            pending["message_id"] = message_id
+            self._answer_callback(telegram, callback_id, "正在执行")
+            try:
+                self._execute_pending(telegram, pending)
+            except Exception as exc:
+                detail = self.guard.compact_error(
+                    exc, secrets=self.guard.telegram_secrets(telegram)
+                )
+                self.guard.LOGGER.exception("Telegram Bot 控制执行失败: %s", detail)
+                self._display(
+                    telegram,
+                    chat_id,
+                    "操作失败: {}".format(detail),
+                    self._menu_markup(),
+                    message_id=message_id,
+                )
+            return
+        self._answer_callback(telegram, callback_id, "按钮无效", alert=True)
+
+    def _handle_update(self, config, telegram, admins, update):
+        if isinstance(update.get("message"), dict):
+            self._handle_message(config, telegram, admins, update["message"])
+        elif isinstance(update.get("callback_query"), dict):
+            self._handle_callback(config, telegram, admins, update["callback_query"])
+
+    def _prepare_token(self, telegram):
+        fingerprint = _token_fingerprint(telegram.get("bot_token"))
+        token_changed = fingerprint != self.fingerprint
+        if (
+            not token_changed
+            and self.offset is not None
+            and not self.drain_pending
+        ):
+            return
+        if token_changed:
+            self.drain_pending = True
+        self.fingerprint = fingerprint
+        self.offset = None if self.drain_pending else _load_offset(self.guard, fingerprint)
+        if self.offset is None:
+            updates = self._telegram_api(
+                telegram,
+                "getUpdates",
+                {
+                    "offset": -1,
+                    "limit": 1,
+                    "timeout": 0,
+                    "allowed_updates": json.dumps(["message", "callback_query"]),
+                },
+            ) or []
+            self.offset = (
+                max(int(item.get("update_id", -1)) for item in updates) + 1
+                if updates
+                else 0
+            )
+            _save_offset(self.guard, fingerprint, self.offset)
+            self.guard.LOGGER.info("Telegram Bot 控制已丢弃启用前的待处理消息")
+        self.drain_pending = False
+        if self.commands_fingerprint != fingerprint:
+            try:
+                self._telegram_api(
+                    telegram,
+                    "setMyCommands",
+                    {
+                        "commands": json.dumps(BOT_COMMANDS, ensure_ascii=False),
+                        "scope": json.dumps({"type": "all_private_chats"}),
+                    },
+                )
+            except Exception as exc:
+                self.guard.LOGGER.warning(
+                    "Telegram Bot 命令菜单注册失败，文本命令仍可使用: %s",
+                    self.guard.compact_error(exc),
+                )
+            self.commands_fingerprint = fingerprint
+
+    def _run(self):
+        while not self.stop_event.is_set():
+            try:
+                config, telegram, admins = self._poll_config()
+                if telegram is None:
+                    self.stop_event.wait(RETRY_WAIT_SECONDS)
+                    continue
+                self._prepare_token(telegram)
+                updates = self._telegram_api(
+                    telegram,
+                    "getUpdates",
+                    {
+                        "offset": self.offset,
+                        "limit": 100,
+                        "timeout": POLL_TIMEOUT_SECONDS,
+                        "allowed_updates": json.dumps(["message", "callback_query"]),
+                    },
+                    long_poll=True,
+                ) or []
+                if updates:
+                    self.offset = max(
+                        int(item.get("update_id", -1)) for item in updates
+                    ) + 1
+                    _save_offset(self.guard, self.fingerprint, self.offset)
+                    latest_config, latest_telegram, latest_admins = self._poll_config()
+                    if latest_telegram is None:
+                        continue
+                    if _token_fingerprint(latest_telegram.get("bot_token")) != self.fingerprint:
+                        self.drain_pending = True
+                        continue
+                    for update in updates:
+                        try:
+                            self._handle_update(
+                                latest_config,
+                                latest_telegram,
+                                latest_admins,
+                                update,
+                            )
+                        except Exception as exc:
+                            self.guard.LOGGER.exception(
+                                "Telegram Bot 单条更新处理失败: %s",
+                                self.guard.compact_error(
+                                    exc,
+                                    secrets=self.guard.telegram_secrets(latest_telegram),
+                                ),
+                            )
+                if self.last_error is not None:
+                    self.guard.LOGGER.info("Telegram Bot 控制连接已恢复")
+                    self.last_error = None
+            except Exception as exc:
+                detail = self.guard.compact_error(exc)
+                if detail != self.last_error:
+                    self.guard.LOGGER.warning("Telegram Bot 控制轮询失败: %s", detail)
+                    self.last_error = detail
+                self.stop_event.wait(RETRY_WAIT_SECONDS)
+
+
+def start_background(guard):
+    return TelegramControlService(guard).start()
+__AG_CONTROL_PY_EOF__
     cat > "$APP_DIR/web_actions.py" <<'__AG_WEB_ACTIONS_PY_EOF__'
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Management operations exposed by the authenticated web panel."""
 
 import copy
+import base64
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import time
 
 import telegram_proxy
+import backup_manager
+import s3_backup
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
+DATA_DIR = Path(
+    os.environ.get("ALIYUN_GUARD_CONFIG", APP_DIR / "config.json")
+).parent
+UPDATE_LOG_NAME = "web-update.log"
+UPDATE_STATE_NAME = "web-update-state.json"
+UPDATE_EXIT_MARKER = "__AG_UPDATE_EXIT_CODE="
 
 CONNECTION_LABELS = {
     "direct": "直连",
@@ -1065,11 +3630,19 @@ def telegram_payload(guard, telegram):
     nodes = guard.telegram_node_urls(telegram)
     active = str(telegram.get("node_url", "") or "").strip()
     mode = str(telegram.get("connection_mode", "direct") or "direct")
+    explicit_admins = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    effective_admins = guard.telegram_control_admin_ids(telegram)
     return {
         "bot_token_configured": bool(str(telegram.get("bot_token", "")).strip()),
         "chat_id": str(telegram.get("chat_id", "")),
         "timeout_seconds": int(telegram.get("timeout_seconds", 12)),
         "retries": int(telegram.get("retries", 3)),
+        "control_enabled": bool(telegram.get("control_enabled", True)),
+        "control_admin_ids": explicit_admins,
+        "control_effective_admin_ids": effective_admins,
+        "control_uses_chat_id": bool(effective_admins and not explicit_admins),
         "connection_mode": mode,
         "connection_label": CONNECTION_LABELS.get(mode, "未知"),
         "connection_description": guard.telegram_connection_description(telegram),
@@ -1104,6 +3677,15 @@ def management_payload(guard, backend="unknown"):
             "start_wait_seconds": int(config.get("start_wait_seconds", 90)),
             "stop_wait_seconds": int(config.get("stop_wait_seconds", 45)),
             "start_poll_seconds": int(config.get("start_poll_seconds", 5)),
+            "watchdog": {
+                "enabled": bool(config.get("watchdog", {}).get("enabled", True)),
+                "timeout_seconds": int(
+                    config.get("watchdog", {}).get("timeout_seconds", 600)
+                ),
+                "failure_threshold": int(
+                    config.get("watchdog", {}).get("failure_threshold", 2)
+                ),
+            },
         },
         "web": {
             "enabled": bool(web.get("enabled", False)),
@@ -1113,7 +3695,403 @@ def management_payload(guard, backend="unknown"):
             "password_configured": bool(str(web.get("password_hash", "")).strip()),
         },
         "backend": backend,
+        "s3_backup": s3_backup_payload(config.get("s3_backup", {})),
+        "rollback_snapshots": [
+            {
+                "name": path.name,
+                "size": path.stat().st_size,
+                "modified_at": int(path.stat().st_mtime),
+            }
+            for path in backup_manager.list_program_snapshots(app_dir=APP_DIR)
+        ],
     }
+
+
+def s3_backup_payload(value):
+    config = s3_backup.normalized_config(value)
+    status = s3_backup.read_status(DATA_DIR)
+    return {
+        "enabled": bool(config.get("enabled", False)),
+        "bucket": config["bucket"],
+        "region": config["region"],
+        "endpoint_url": config["endpoint_url"],
+        "prefix": config["prefix"],
+        "addressing_style": config["addressing_style"],
+        "access_key_configured": bool(config["access_key_id"]),
+        "uses_iam_role": not bool(config["access_key_id"]),
+        "session_token_configured": bool(config["session_token"]),
+        "backup_password_configured": bool(config["backup_password"]),
+        "schedule": config["schedule"],
+        "time": config["time"],
+        "weekday": int(config["weekday"]),
+        "retention": int(config["retention"]),
+        "include_state": bool(config["include_state"]),
+        "include_logs": bool(config["include_logs"]),
+        "notification_mode": config["notification_mode"],
+        "server_side_encryption": config["server_side_encryption"],
+        "kms_key_configured": bool(config["kms_key_id"]),
+        "status": {
+            "last_attempt_at": status.get("last_attempt_at"),
+            "last_success_at": status.get("last_success_at"),
+            "last_key": status.get("last_key"),
+            "last_error": status.get("last_error"),
+        },
+    }
+
+
+def _s3_candidate(guard, data, save=False):
+    if not isinstance(data, dict):
+        raise ManagementError("S3 配置必须是对象")
+    config = guard.load_config()
+    current = s3_backup.normalized_config(config.get("s3_backup", {}))
+    candidate = dict(current)
+    for field in (
+        "bucket",
+        "region",
+        "endpoint_url",
+        "prefix",
+        "schedule",
+        "time",
+        "notification_mode",
+        "server_side_encryption",
+        "addressing_style",
+    ):
+        if field in data:
+            candidate[field] = str(data.get(field, "") or "").strip()
+    for field in ("enabled", "include_state", "include_logs"):
+        if field in data:
+            candidate[field] = _boolean(data, field, candidate[field])
+    candidate["weekday"] = _integer(
+        data, "weekday", candidate["weekday"], 0, 6
+    )
+    candidate["retention"] = _integer(
+        data, "retention", candidate["retention"], 1, 365
+    )
+    use_iam_role = _boolean(
+        data, "use_iam_role", not bool(current["access_key_id"])
+    )
+    if use_iam_role:
+        candidate["access_key_id"] = ""
+        candidate["secret_access_key"] = ""
+        candidate["session_token"] = ""
+    else:
+        for field in ("access_key_id", "secret_access_key", "session_token"):
+            entered = str(data.get(field, "") or "").strip()
+            if entered:
+                candidate[field] = entered
+        if _boolean(data, "clear_session_token", False):
+            candidate["session_token"] = ""
+        if (
+            (candidate["enabled"] or not save)
+            and (not candidate["access_key_id"] or not candidate["secret_access_key"])
+        ):
+            raise ManagementError("未使用 IAM Role 时必须填写 S3 Access Key 和 Secret")
+    entered_password = str(data.get("backup_password", "") or "").strip()
+    if entered_password:
+        candidate["backup_password"] = entered_password
+    entered_kms = str(data.get("kms_key_id", "") or "").strip()
+    if entered_kms:
+        candidate["kms_key_id"] = entered_kms
+    elif candidate.get("server_side_encryption") != "aws:kms":
+        candidate["kms_key_id"] = ""
+    try:
+        candidate = s3_backup.validate_config(
+            candidate, require_ready=bool(candidate.get("enabled")) or not save
+        )
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(str(exc))
+    if save:
+        config["s3_backup"] = candidate
+        _save_config(guard, config)
+    return candidate
+
+
+def save_s3_backup_settings(guard, data):
+    candidate = _s3_candidate(guard, data, save=True)
+    return s3_backup_payload(candidate)
+
+
+def test_s3_backup_settings(guard, data):
+    candidate = _s3_candidate(guard, data, save=False)
+    try:
+        return s3_backup.test_connection(candidate)
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(
+                    candidate["access_key_id"],
+                    candidate["secret_access_key"],
+                    candidate["session_token"],
+                    candidate["backup_password"],
+                ),
+            ),
+            502,
+        )
+
+
+def run_s3_backup_now(guard):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    try:
+        return s3_backup.create_and_upload(
+            backup, DATA_DIR
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(
+                    backup["access_key_id"],
+                    backup["secret_access_key"],
+                    backup["session_token"],
+                    backup["backup_password"],
+                ),
+            ),
+            502,
+        )
+
+
+def list_s3_backups(guard):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    try:
+        return s3_backup.list_backups(backup, limit=100)
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"]),
+            ),
+            502,
+        )
+
+
+def preview_s3_backup(guard, key):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    path = None
+    try:
+        path = s3_backup.download_backup(backup, key, DATA_DIR)
+        return backup_manager.preview_restore(
+            path, backup["backup_password"], DATA_DIR
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"], backup["backup_password"]),
+            ),
+            502,
+        )
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
+def restore_s3_backup(guard, key, include_logs=True):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    path = None
+    try:
+        path = s3_backup.download_backup(backup, key, DATA_DIR)
+        return backup_manager.restore_backup(
+            path,
+            backup["backup_password"],
+            DATA_DIR,
+            include_logs=bool(include_logs),
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"], backup["backup_password"]),
+            ),
+            502,
+        )
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
+def _decode_backup(data):
+    encoded = str(data.get("backup_base64", "") or "").strip()
+    if not encoded:
+        raise ManagementError("请选择备份文件")
+    try:
+        content = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except Exception as exc:
+        raise ManagementError("备份文件编码无效") from exc
+    if len(content) > backup_manager.MAX_BACKUP_FILE_BYTES:
+        raise ManagementError("备份文件过大", 413)
+    return content
+
+
+def _backup_tempfile(content):
+    directory = DATA_DIR / "backups"
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / ".web-upload-{}-{}.agbackup".format(
+        os.getpid(), int(time.time() * 1000)
+    )
+    temporary.write_bytes(content)
+    os.chmod(str(temporary), 0o600)
+    return temporary
+
+
+def create_encrypted_backup(data):
+    password = str(data.get("password", "") or "")
+    include_state = _boolean(data, "include_state", True)
+    include_logs = _boolean(data, "include_logs", True)
+    try:
+        path = backup_manager.create_backup(
+            password,
+            app_dir=DATA_DIR,
+            include_state=include_state,
+            include_logs=include_logs,
+        )
+        content = path.read_bytes()
+        return {
+            "filename": path.name,
+            "backup_base64": base64.b64encode(content).decode("ascii"),
+            "size": len(content),
+        }
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc))
+
+
+def preview_encrypted_backup(data):
+    content = _decode_backup(data)
+    temporary = _backup_tempfile(content)
+    try:
+        return backup_manager.preview_restore(
+            temporary, str(data.get("password", "") or ""), app_dir=DATA_DIR
+        )
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def restore_encrypted_backup(data):
+    content = _decode_backup(data)
+    include_logs = _boolean(data, "include_logs", True)
+    temporary = _backup_tempfile(content)
+    try:
+        return backup_manager.restore_backup(
+            temporary,
+            str(data.get("password", "") or ""),
+            app_dir=DATA_DIR,
+            include_logs=include_logs,
+        )
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def rollback_program(snapshot_name=None):
+    snapshot = None
+    if snapshot_name:
+        name = Path(str(snapshot_name)).name
+        if name != str(snapshot_name) or not name.startswith("program-"):
+            raise ManagementError("程序快照名称无效")
+        snapshot = APP_DIR / "backups" / name
+    try:
+        return backup_manager.restore_program_snapshot(snapshot, app_dir=APP_DIR)
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc), 409)
+
+
+def discover_instances(guard, data):
+    if not isinstance(data, dict):
+        raise ManagementError("实例发现参数无效")
+    ak = _required_text(data, "ak", label="AccessKey ID")
+    sk = _required_text(data, "sk", label="AccessKey Secret")
+    regions = data.get("regions", [])
+    if isinstance(regions, str):
+        regions = [item.strip() for item in regions.replace(";", ",").split(",") if item.strip()]
+    if not isinstance(regions, list):
+        raise ManagementError("Region 列表格式无效")
+    if not regions:
+        try:
+            regions = guard.discover_ecs_regions(ak, sk)
+        except Exception as exc:
+            raise ManagementError(
+                "自动获取 Region 失败: {}".format(
+                    guard.compact_error(exc, secrets=(ak, sk))
+                ),
+                502,
+            )
+    try:
+        result = guard.discover_ecs_instances(
+            ak,
+            sk,
+            regions,
+            tag_key=str(data.get("tag_key", "") or "").strip(),
+            tag_value=str(data.get("tag_value", "") or "").strip(),
+        )
+    except Exception as exc:
+        raise ManagementError(
+            guard.compact_error(exc, secrets=(ak, sk)), 502
+        )
+    existing = {
+        (str(item.get("ak", "")), str(item.get("region", "")), str(item.get("instance_id", "")))
+        for item in guard.load_config().get("users", [])
+    }
+    for item in result.get("instances", []):
+        item["already_configured"] = (ak, item["region"], item["instance_id"]) in existing
+    return result
+
+
+def import_discovered_instances(guard, data):
+    ak = _required_text(data, "ak", label="AccessKey ID")
+    sk = _required_text(data, "sk", label="AccessKey Secret")
+    selected = data.get("instances", [])
+    if not isinstance(selected, list) or not selected:
+        raise ManagementError("请选择至少一个实例")
+    if len(selected) > 100:
+        raise ManagementError("一次最多导入 100 个实例")
+    limit = _number(data, "traffic_limit_gb", 180, 0.01)
+    actions_enabled = _boolean(data, "actions_enabled", True)
+    billing_site = str(data.get("billing_site", "china") or "china")
+    billing = _copy(BILLING_PRESETS.get(billing_site, BILLING_PRESETS["china"]))
+    config = guard.load_config()
+    users = config.setdefault("users", [])
+    identities = {
+        (str(item.get("ak", "")), str(item.get("region", "")), str(item.get("instance_id", "")))
+        for item in users
+    }
+    imported = []
+    skipped = []
+    for raw in selected:
+        if not isinstance(raw, dict):
+            continue
+        region = str(raw.get("region", "") or "").strip()
+        instance_id = str(raw.get("instance_id", "") or "").strip()
+        identity = (ak, region, instance_id)
+        if not region or not instance_id or identity in identities:
+            skipped.append(instance_id or "无效实例")
+            continue
+        user = {
+            "name": str(raw.get("name", "") or instance_id).strip()[:80],
+            "ak": ak,
+            "sk": sk,
+            "region": region,
+            "instance_id": instance_id,
+            "traffic_limit_gb": limit,
+            "actions_enabled": actions_enabled,
+            "instance_log_enabled": False,
+            "paused": False,
+            "billing": _copy(billing),
+            "schedule": _copy(guard.DEFAULT_SCHEDULE),
+        }
+        users.append(user)
+        identities.add(identity)
+        imported.append(instance_id)
+    if not imported:
+        raise ManagementError("所选实例均已存在或数据无效", 409)
+    _save_config(guard, config)
+    return {"imported": imported, "skipped": skipped, "count": len(imported)}
 
 
 def _normalize_billing(guard, raw, existing):
@@ -1327,6 +4305,33 @@ def update_global_settings(guard, data):
     config["start_poll_seconds"] = _integer(
         data, "start_poll_seconds", config.get("start_poll_seconds", 5), 1, 60
     )
+    watchdog_data = data.get("watchdog", {})
+    if not isinstance(watchdog_data, dict):
+        raise ManagementError("watchdog 必须是对象")
+    current_watchdog = config.get("watchdog", {})
+    if not isinstance(current_watchdog, dict):
+        current_watchdog = {}
+    config["watchdog"] = {
+        "enabled": _boolean(
+            watchdog_data,
+            "enabled",
+            bool(current_watchdog.get("enabled", True)),
+        ),
+        "timeout_seconds": _integer(
+            watchdog_data,
+            "timeout_seconds",
+            current_watchdog.get("timeout_seconds", 600),
+            120,
+            86400,
+        ),
+        "failure_threshold": _integer(
+            watchdog_data,
+            "failure_threshold",
+            current_watchdog.get("failure_threshold", 2),
+            1,
+            10,
+        ),
+    }
     _save_config(guard, config)
     return management_payload(guard)["settings"]
 
@@ -1413,6 +4418,18 @@ def update_telegram_identity(guard, data):
     telegram["retries"] = _integer(
         data, "retries", telegram.get("retries", 3), 1, 5
     )
+    telegram["control_enabled"] = _boolean(
+        data,
+        "control_enabled",
+        bool(telegram.get("control_enabled", True)),
+    )
+    if "control_admin_ids" in data:
+        try:
+            telegram["control_admin_ids"] = guard.normalize_telegram_control_admin_ids(
+                data.get("control_admin_ids")
+            )
+        except Exception as exc:
+            raise ManagementError(str(exc))
     _save_config(guard, config)
     return telegram_payload(guard, telegram)
 
@@ -1585,6 +4602,140 @@ def check_update():
     }
 
 
+def _update_paths():
+    log_dir = APP_DIR / "logs"
+    return log_dir / UPDATE_LOG_NAME, log_dir / UPDATE_STATE_NAME
+
+
+def _write_update_state(data):
+    _log_path, state_path = _update_paths()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = state_path.with_name(state_path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    os.replace(str(temporary), str(state_path))
+
+
+def _read_update_state():
+    _log_path, state_path = _update_paths()
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _prepare_update_tracking(target_version=None, backend=""):
+    log_path, _state_path = _update_paths()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("网页更新任务已启动。\n", encoding="utf-8")
+    os.chmod(log_path, 0o600)
+    version = str(target_version or "").strip()
+    if len(version) > 32 or any(
+        character not in "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-+"
+        for character in version
+    ):
+        version = ""
+    state = {
+        "status": "running",
+        "started_at": int(time.time()),
+        "target_version": version or None,
+        "backend": str(backend or ""),
+        "job": None,
+    }
+    _write_update_state(state)
+    return state
+
+
+def _update_log_text(limit=262144):
+    log_path, _state_path = _update_paths()
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - int(limit)), os.SEEK_SET)
+            return handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def update_progress():
+    state = _read_update_state()
+    text = _update_log_text()
+    if not state and not text:
+        return {
+            "status": "idle",
+            "progress": 0,
+            "message": "尚未启动更新",
+            "target_version": None,
+        }
+
+    stages = [
+        ("网页更新任务已启动", 3, "正在启动更新任务"),
+        ("正在下载更新和校验文件", 12, "正在下载正式版文件"),
+        ("SHA-256 校验通过", 25, "文件校验通过"),
+        ("[1/6]", 35, "正在检查系统依赖"),
+        ("[2/6]", 48, "正在更新 Python 环境"),
+        ("[3/6]", 62, "正在写入程序文件"),
+        ("[4/6]", 74, "正在恢复本机配置"),
+        ("[5/6]", 86, "正在重启后台服务"),
+        ("[6/6]", 95, "正在验证更新结果"),
+        ("安装完成。", 98, "程序文件已安装"),
+    ]
+    progress = 0
+    message = "等待更新进程输出"
+    for marker, value, label in stages:
+        if marker in text and value >= progress:
+            progress = value
+            message = label
+
+    exit_code = None
+    if UPDATE_EXIT_MARKER in text:
+        tail = text.rsplit(UPDATE_EXIT_MARKER, 1)[-1].splitlines()[0].strip()
+        try:
+            exit_code = int(tail)
+        except ValueError:
+            exit_code = None
+    success = "GitHub 最新版本已安装，后台服务已重启" in text or exit_code == 0
+    started_at = int(state.get("started_at", 0) or 0)
+    timed_out = bool(started_at and time.time() - started_at > 3600)
+    failure = (
+        state.get("status") == "error"
+        or timed_out
+        or exit_code not in (None, 0)
+        or any(
+            marker in text
+            for marker in (
+                "更新下载失败:",
+                "执行更新失败:",
+                "更新安装器退出码:",
+                "错误:",
+            )
+        )
+    )
+    if success:
+        status = "success"
+        progress = 100
+        message = "更新完成，后台服务已重新加载"
+    elif failure:
+        status = "error"
+        message = "更新失败，请查看 web-update.log"
+    else:
+        status = "running"
+
+    return {
+        "status": status,
+        "progress": max(0, min(100, int(progress))),
+        "message": message,
+        "target_version": state.get("target_version"),
+        "started_at": state.get("started_at"),
+        "job": state.get("job"),
+    }
+
+
 def detached_process(command, log_name):
     log_path = APP_DIR / "logs" / log_name
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1603,6 +4754,60 @@ def detached_process(command, log_name):
     finally:
         log_handle.close()
     return process.pid
+
+
+def _update_wrapper_command(command, log_path):
+    shell_command = (
+        'log_path=$1; shift; "$@" >>"$log_path" 2>&1; '
+        'rc=$?; printf "\\n{}%s\\n" "$rc" >>"$log_path"; exit "$rc"'
+    ).format(UPDATE_EXIT_MARKER)
+    return [
+        "/bin/sh",
+        "-c",
+        shell_command,
+        "aliyun-guard-update",
+        str(log_path),
+        *command,
+    ]
+
+
+def systemd_update_process(command, log_name):
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run:
+        raise ManagementError(
+            "当前 systemd 环境缺少 systemd-run，无法从网页安全更新；"
+            "请通过 SSH 执行 aliyun-guard update",
+            500,
+        )
+    log_path = APP_DIR / "logs" / log_name
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.touch(mode=0o600, exist_ok=True)
+    os.chmod(log_path, 0o600)
+    unit = "aliyun-guard-update-{}-{}".format(os.getpid(), int(time.time() * 1000))
+    launcher = [
+        systemd_run,
+        "--quiet",
+        "--no-block",
+        "--property=StandardInput=null",
+        "--unit={}".format(unit),
+        *_update_wrapper_command(command, log_path),
+    ]
+    try:
+        result = subprocess.run(
+            launcher,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        raise ManagementError("启动独立更新服务失败: {}".format(exc), 500)
+    if result.returncode != 0:
+        detail = str(result.stdout or "systemd-run 返回错误").strip()
+        raise ManagementError("启动独立更新服务失败: {}".format(detail), 500)
+    return unit
 
 
 def service_command(action):
@@ -1625,7 +4830,7 @@ def service_command(action):
         raise ManagementError("服务重启失败: {}".format(exc), 500)
 
 
-def install_update():
+def install_update(target_version=None):
     if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
         raise ManagementError(
             "Docker 部署请在宿主机执行 git pull && docker compose up -d --build",
@@ -1634,12 +4839,35 @@ def install_update():
     manager_path = APP_DIR / "manager.py"
     if not manager_path.exists():
         raise ManagementError("更新程序不存在", 500)
+    if update_progress().get("status") == "running":
+        raise ManagementError("已有更新任务正在运行，请等待当前任务完成", 409)
+    command = [sys.executable, "-u", str(manager_path), "update", "--yes"]
+    backend_path = APP_DIR / "service_backend"
     try:
-        return detached_process(
-            [sys.executable, str(manager_path), "update", "--yes"],
-            "web-update.log",
-        )
+        backend = backend_path.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        backend = ""
+    state = _prepare_update_tracking(target_version=target_version, backend=backend)
+    try:
+        if backend == "systemd":
+            job = systemd_update_process(command, UPDATE_LOG_NAME)
+        else:
+            log_path, _state_path = _update_paths()
+            job = detached_process(
+                _update_wrapper_command(command, log_path), UPDATE_LOG_NAME
+            )
+        state["job"] = str(job)
+        _write_update_state(state)
+        return job
+    except ManagementError as exc:
+        state["status"] = "error"
+        state["message"] = str(exc)
+        _write_update_state(state)
+        raise
     except Exception as exc:
+        state["status"] = "error"
+        state["message"] = str(exc)
+        _write_update_state(state)
         raise ManagementError("启动更新失败: {}".format(exc), 500)
 __AG_WEB_ACTIONS_PY_EOF__
     cat > "$APP_DIR/web_panel.py" <<'__AG_WEB_PY_EOF__'
@@ -1675,14 +4903,14 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.9"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
 SUPERVISOR_LOCK_FILE = APP_DIR / "web-panel-supervisor.lock"
 DISABLED_FILE = APP_DIR / "disabled"
 BACKEND_FILE = APP_DIR / "service_backend"
-MAX_BODY_BYTES = 64 * 1024
+MAX_BODY_BYTES = 128 * 1024 * 1024
 SESSION_SECONDS = 12 * 60 * 60
 PASSWORD_ITERATIONS = 260000
 
@@ -2106,6 +5334,7 @@ def _write_manual_instance_log(
     message="",
     errors=None,
     level="error",
+    source="网页",
 ):
     guard.write_instance_log(
         user,
@@ -2126,11 +5355,19 @@ def _write_manual_instance_log(
             "message": message,
             "errors": list(errors or []),
         },
-        event="网页手动{}".format("开机" if action == "start" else "关机"),
+        event="{}手动{}".format(source, "开机" if action == "start" else "关机"),
     )
 
 
-def control_instance(guard, index, action):
+def control_instance(
+    guard,
+    index,
+    action,
+    source="网页控制台",
+    notify=True,
+    allow_threshold_override=False,
+    pause_on_threshold_override=False,
+):
     if action not in ("start", "stop"):
         raise WebPanelError("开关机动作无效")
     with guard.cycle_lock() as locked:
@@ -2148,6 +5385,8 @@ def control_instance(guard, index, action):
         traffic = None
         performed = False
         poll_error = None
+        threshold_overridden = False
+        monitor_paused = False
         try:
             schedule_target = guard.schedule_target(user)
             automation_active = bool(user.get("actions_enabled", True)) and not bool(
@@ -2167,13 +5406,20 @@ def control_instance(guard, index, action):
                 traffic = guard.query_cdt_traffic_gb(user)
                 limit = float(user.get("traffic_limit_gb", 0) or 0)
                 if traffic >= limit:
-                    raise WebPanelError(
-                        "当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值，拒绝开机".format(
-                            traffic, limit
-                        ),
-                        409,
-                    )
+                    if not allow_threshold_override:
+                        raise WebPanelError(
+                            "当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值，拒绝开机".format(
+                                traffic, limit
+                            ),
+                            409,
+                        )
+                    threshold_overridden = True
                 if before != "Running":
+                    if threshold_overridden and pause_on_threshold_override:
+                        user["paused"] = True
+                        guard.validate_config(config)
+                        guard.atomic_write_json(guard.CONFIG_FILE, config, mode=0o600)
+                        monitor_paused = True
                     guard.start_instance(user)
                     performed = True
                     after, poll_error = guard.wait_for_status(
@@ -2196,8 +5442,8 @@ def control_instance(guard, index, action):
             else:
                 after = before
         except WebPanelError as exc:
-            message = "网页控制台手动{}未执行: {}".format(
-                "开机" if action == "start" else "关机", exc
+            message = "{}手动{}未执行: {}".format(
+                source, "开机" if action == "start" else "关机", exc
             )
             _write_manual_instance_log(
                 guard,
@@ -2209,6 +5455,7 @@ def control_instance(guard, index, action):
                 performed=performed,
                 message=message,
                 errors=[str(exc)],
+                source="网页" if source == "网页控制台" else source,
             )
             raise
         except Exception as exc:
@@ -2216,6 +5463,8 @@ def control_instance(guard, index, action):
             message = "实例{}失败: {}".format(
                 "开机" if action == "start" else "关机", error
             )
+            if monitor_paused:
+                message += "；该实例监控已暂停，请处理后按需恢复"
             _write_manual_instance_log(
                 guard,
                 user,
@@ -2226,10 +5475,12 @@ def control_instance(guard, index, action):
                 performed=performed,
                 message=message,
                 errors=[error],
+                source="网页" if source == "网页控制台" else source,
             )
             raise WebPanelError(message, 502)
 
-        message = "网页控制台手动{}\n实例: {} ({})\n状态: {} -> {}".format(
+        message = "{}手动{}\n实例: {} ({})\n状态: {} -> {}".format(
+            source,
             "开机" if action == "start" else "关机",
             name,
             user.get("instance_id"),
@@ -2238,13 +5489,16 @@ def control_instance(guard, index, action):
         )
         if poll_error:
             message += "\n状态复查: {}".format(poll_error)
+        if monitor_paused:
+            message += "\n监控: 已自动暂停（流量阈值强制开机）"
         notify_error = None
-        try:
-            guard.send_telegram_message(config.get("telegram", {}), message)
-        except Exception as exc:
-            notify_error = guard.compact_error(
-                exc, secrets=guard.telegram_secrets(config.get("telegram", {}))
-            )
+        if notify:
+            try:
+                guard.send_telegram_message(config.get("telegram", {}), message)
+            except Exception as exc:
+                notify_error = guard.compact_error(
+                    exc, secrets=guard.telegram_secrets(config.get("telegram", {}))
+                )
         log_errors = []
         if poll_error:
             log_errors.append("ECS 状态复查失败: {}".format(poll_error))
@@ -2270,6 +5524,7 @@ def control_instance(guard, index, action):
             message=message,
             errors=log_errors,
             level=level,
+            source="网页" if source == "网页控制台" else source,
         )
         instances[str(user.get("instance_id", ""))] = dict(
             previous,
@@ -2307,6 +5562,8 @@ def control_instance(guard, index, action):
             "after": after or "Unknown",
             "message": message,
             "notification_error": notify_error,
+            "threshold_overridden": threshold_overridden,
+            "monitor_paused": monitor_paused,
         }
 
 
@@ -2473,7 +5730,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             length = int(self.headers.get("Content-Length", "0"))
         except ValueError:
             raise WebPanelError("请求长度无效")
-        if length <= 0 or length > MAX_BODY_BYTES:
+        route = urllib.parse.urlsplit(self.path).path
+        backup_upload = route in ("/api/backup/preview", "/api/backup/restore")
+        maximum = MAX_BODY_BYTES if backup_upload else 1024 * 1024
+        if length <= 0 or length > maximum:
             raise WebPanelError("请求内容为空或过大", 413)
         try:
             value = json.loads(self.rfile.read(length).decode("utf-8"))
@@ -2543,6 +5803,9 @@ class PanelHandler(BaseHTTPRequestHandler):
                     }
                 )
                 return
+            if parts == ["api", "update", "progress"]:
+                self._json(web_actions.update_progress())
+                return
             self._authenticated()
             if parts == ["api", "dashboard"]:
                 with self.server.job_lock:
@@ -2554,6 +5817,11 @@ class PanelHandler(BaseHTTPRequestHandler):
                 return
             if parts == ["api", "update"]:
                 self._json(web_actions.check_update())
+                return
+            if parts == ["api", "s3-backup", "list"]:
+                self._json(
+                    {"ok": True, "backups": web_actions.list_s3_backups(self.server.guard)}
+                )
                 return
             if parts == ["api", "logs"]:
                 query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
@@ -2666,6 +5934,77 @@ class PanelHandler(BaseHTTPRequestHandler):
                 )
                 self._json({"ok": True, "result": result})
                 return
+            if parts == ["api", "backup", "create"]:
+                self._authenticated(require_csrf=True)
+                result = web_actions.create_encrypted_backup(self._read_json())
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "settings"]:
+                result = web_actions.save_s3_backup_settings(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "s3_backup": result})
+                return
+            if parts == ["api", "s3-backup", "test"]:
+                result = web_actions.test_s3_backup_settings(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "run"]:
+                self._read_json()
+                result = web_actions.run_s3_backup_now(self.server.guard)
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "preview"]:
+                data = self._read_json()
+                result = web_actions.preview_s3_backup(
+                    self.server.guard, data.get("key")
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "s3-backup", "restore"]:
+                data = self._read_json()
+                result = web_actions.restore_s3_backup(
+                    self.server.guard,
+                    data.get("key"),
+                    include_logs=web_actions._boolean(data, "include_logs", True),
+                )
+                self.server.delayed_restart()
+                self._json({"ok": True, "result": result}, 202)
+                return
+            if parts == ["api", "backup", "preview"]:
+                self._authenticated(require_csrf=True)
+                result = web_actions.preview_encrypted_backup(self._read_json())
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "backup", "restore"]:
+                self._authenticated(require_csrf=True)
+                result = web_actions.restore_encrypted_backup(self._read_json())
+                self.server.delayed_restart()
+                self._json({"ok": True, "result": result}, 202)
+                return
+            if parts == ["api", "rollback"]:
+                self._authenticated(require_csrf=True)
+                data = self._read_json()
+                result = web_actions.rollback_program(data.get("snapshot"))
+                self.server.delayed_restart()
+                self._json({"ok": True, "result": result}, 202)
+                return
+            if parts == ["api", "discovery", "scan"]:
+                self._authenticated(require_csrf=True)
+                result = web_actions.discover_instances(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
+            if parts == ["api", "discovery", "import"]:
+                self._authenticated(require_csrf=True)
+                result = web_actions.import_discovered_instances(
+                    self.server.guard, self._read_json()
+                )
+                self._json({"ok": True, "result": result})
+                return
             if len(parts) == 3 and parts[:2] == ["api", "instances"]:
                 try:
                     index = int(parts[2])
@@ -2682,8 +6021,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "message": "后台服务重启已安排"}, 202)
                 return
             if parts == ["api", "update", "install"]:
-                self._read_json()
-                pid = web_actions.install_update()
+                data = self._read_json()
+                pid = web_actions.install_update(data.get("target_version"))
                 self._json({"ok": True, "pid": pid}, 202)
                 return
             if len(parts) == 4 and parts[:2] == ["api", "instances"]:
@@ -3394,6 +6733,17 @@ __AG_WEB_PY_EOF__
     .active-mark { color: var(--brand); font-size: 11px; font-weight: 700; }
     .inline-result { min-height: 40px; margin-top: 12px; padding: 10px 11px; border-left: 3px solid var(--cyan); background: #eef7f8; color: #30545c; border-radius: 3px; overflow-wrap: anywhere; }
     .inline-result.error { border-left-color: var(--red); background: #fff3f2; color: #7f302c; }
+    .update-progress { margin-top: 12px; display: grid; gap: 7px; }
+    .update-progress-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 12px; }
+    .update-progress-head span { min-width: 0; overflow-wrap: anywhere; }
+    .update-progress-head strong { color: var(--ink); flex: 0 0 auto; }
+    .update-progress progress { width: 100%; height: 10px; display: block; border: 0; border-radius: 3px; overflow: hidden; background: #e2e8e4; accent-color: var(--brand); }
+    .update-progress progress::-webkit-progress-bar { background: #e2e8e4; }
+    .update-progress progress::-webkit-progress-value { background: var(--brand); transition: width .25s ease; }
+    .update-progress progress::-moz-progress-bar { background: var(--brand); }
+    .update-progress.error progress { accent-color: var(--red); }
+    .update-progress.error progress::-webkit-progress-value { background: var(--red); }
+    .update-progress.error progress::-moz-progress-bar { background: var(--red); }
     .system-list { display: grid; gap: 10px; }
     .system-row { display: flex; justify-content: space-between; gap: 16px; padding-bottom: 10px; border-bottom: 1px solid #edf1ee; }
     .system-row:last-child { padding-bottom: 0; border-bottom: 0; }
@@ -3553,6 +6903,7 @@ __AG_WEB_PY_EOF__
             <button id="dryRunButton" class="button secondary" type="button"><span data-icon="flask-conical"></span>演练检测</button>
             <button id="runButton" class="button primary" type="button"><span data-icon="play"></span>立即检测</button>
             <button id="addInstanceButton" class="button secondary" type="button"><span data-icon="plus"></span>添加实例</button>
+            <button id="discoverInstanceButton" class="button secondary" type="button"><span data-icon="search"></span>自动发现</button>
           </div>
         </div>
         <div class="summary-band">
@@ -3578,6 +6929,8 @@ __AG_WEB_PY_EOF__
               <div class="field"><label for="tgChatId">Chat ID</label><input id="tgChatId" autocomplete="off" required></div>
               <div class="field"><label for="tgTimeout">请求超时（秒）</label><input id="tgTimeout" type="number" min="3" max="60" required></div>
               <div class="field"><label for="tgRetries">重试次数</label><input id="tgRetries" type="number" min="1" max="5" required></div>
+              <div class="field wide"><div class="toggle-row"><div><strong>Bot 控制</strong><div class="brand-sub">仅授权管理员私聊可用</div></div><label class="switch"><input id="tgControlEnabled" type="checkbox"><span></span></label></div></div>
+              <div id="tgControlAdminsField" class="field wide"><label for="tgControlAdmins">管理员 Telegram 用户 ID</label><input id="tgControlAdmins" autocomplete="off" placeholder="留空使用正数私聊 Chat ID"><div id="tgControlHint" class="muted small"></div></div>
             </div>
             <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存机器人配置</button></div>
           </form>
@@ -3642,6 +6995,9 @@ __AG_WEB_PY_EOF__
               <div class="field"><label for="startWait">开机确认等待（秒）</label><input id="startWait" type="number" min="0" max="600" required></div>
               <div class="field"><label for="stopWait">关机确认等待（秒）</label><input id="stopWait" type="number" min="0" max="600" required></div>
               <div class="field"><label for="pollSeconds">状态轮询间隔（秒）</label><input id="pollSeconds" type="number" min="1" max="60" required></div>
+              <label class="check-row wide"><input id="watchdogEnabled" type="checkbox">启用监控失联看门狗</label>
+              <div class="field"><label for="watchdogTimeout">心跳超时（秒）</label><input id="watchdogTimeout" type="number" min="120" max="86400" required></div>
+              <div class="field"><label for="watchdogFailures">连续失败次数</label><input id="watchdogFailures" type="number" min="1" max="10" required></div>
             </div>
             <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="save"></span>保存全局设置</button></div>
           </form>
@@ -3681,8 +7037,67 @@ __AG_WEB_PY_EOF__
               <div class="system-row"><span>本机版本</span><strong id="updateCurrentVersion">--</strong></div>
               <div class="system-row"><span>GitHub 版本</span><strong id="updateLatestVersion">尚未检查</strong></div>
               <div id="updateResult" class="inline-result" hidden></div>
+              <div id="updateProgress" class="update-progress" hidden>
+                <div class="update-progress-head"><span id="updateProgressText">准备更新</span><strong id="updateProgressPercent">0%</strong></div>
+                <progress id="updateProgressBar" max="100" value="0" aria-label="更新进度"></progress>
+              </div>
             </div>
             <div class="panel-actions"><button id="checkUpdateButton" class="button secondary" type="button"><span data-icon="search"></span>检查更新</button><button id="installUpdateButton" class="button primary" type="button" disabled><span data-icon="download"></span>安装更新</button></div>
+          </div>
+          <form id="backupCreateForm" class="panel">
+            <div class="panel-head"><div><h2>加密备份</h2><p>AES-256-GCM，本机和下载文件各保留一份</p></div></div>
+            <div class="panel-body form-grid">
+              <div class="field wide"><label for="backupPassword">备份密码</label><input id="backupPassword" type="password" minlength="8" autocomplete="new-password" required></div>
+              <label class="check-row"><input id="backupState" type="checkbox" checked>包含状态</label>
+              <label class="check-row"><input id="backupLogs" type="checkbox" checked>包含日志</label>
+            </div>
+            <div class="panel-actions"><button class="button primary" type="submit"><span data-icon="download"></span>创建并下载</button></div>
+          </form>
+          <form id="backupRestoreForm" class="panel">
+            <div class="panel-head"><div><h2>恢复备份</h2><p>必须先预览差异，再允许恢复</p></div></div>
+            <div class="panel-body form-grid">
+              <div class="field wide"><label for="restoreFile">备份文件</label><input id="restoreFile" type="file" accept=".agbackup,application/json" required></div>
+              <div class="field wide"><label for="restorePassword">备份密码</label><input id="restorePassword" type="password" minlength="8" autocomplete="current-password" required></div>
+              <label class="check-row wide"><input id="restoreLogs" type="checkbox" checked>恢复备份中的日志</label>
+              <div id="restorePreview" class="inline-result wide" hidden></div>
+            </div>
+            <div class="panel-actions"><button id="previewRestoreButton" class="button secondary" type="button"><span data-icon="search"></span>预览差异</button><button id="restoreBackupButton" class="button warning" type="submit" disabled><span data-icon="refresh-cw"></span>确认恢复</button></div>
+          </form>
+          <form id="s3BackupForm" class="panel full">
+            <div class="panel-head"><div><h2>AWS S3 自动备份</h2><p>AES-256-GCM 加密后上传，兼容 R2 与 MinIO</p></div><span id="s3BackupStatus" class="muted small">未配置</span></div>
+            <div class="panel-body form-grid">
+              <label class="check-row wide"><input id="s3Enabled" type="checkbox">启用自动备份</label>
+              <div class="field"><label for="s3Bucket">Bucket</label><input id="s3Bucket" autocomplete="off"></div>
+              <div class="field"><label for="s3Region">Region</label><input id="s3Region" placeholder="us-east-1"></div>
+              <div class="field wide"><label for="s3Endpoint">自定义 Endpoint</label><input id="s3Endpoint" type="url" placeholder="AWS S3 留空；R2/MinIO 填写 HTTPS 地址"></div>
+              <div class="field"><label for="s3Prefix">对象目录前缀</label><input id="s3Prefix" placeholder="aliyun-guard"></div>
+              <div class="field"><label for="s3AddressingStyle">寻址方式</label><select id="s3AddressingStyle"><option value="auto">自动</option><option value="path">路径寻址</option><option value="virtual">虚拟主机寻址</option></select></div>
+              <label class="check-row wide"><input id="s3IamRole" type="checkbox">使用 EC2 IAM Role 或环境凭据</label>
+              <div id="s3CredentialFields" class="wide form-grid">
+                <div class="field"><label for="s3AccessKey">Access Key ID</label><input id="s3AccessKey" type="password" autocomplete="off"></div>
+                <div class="field"><label for="s3SecretKey">Secret Access Key</label><input id="s3SecretKey" type="password" autocomplete="off"></div>
+                <div class="field wide"><label for="s3SessionToken">Session Token</label><input id="s3SessionToken" type="password" autocomplete="off" placeholder="长期密钥留空"></div>
+                <label class="check-row wide"><input id="s3ClearSessionToken" type="checkbox">清除已保存的 Session Token</label>
+              </div>
+              <div class="field wide"><label for="s3BackupPassword">加密备份密码</label><input id="s3BackupPassword" type="password" minlength="8" autocomplete="new-password"></div>
+              <div class="field"><label for="s3Schedule">周期</label><select id="s3Schedule"><option value="hourly">每小时</option><option value="daily">每天</option><option value="weekly">每周</option></select></div>
+              <div class="field"><label for="s3Time">执行时间</label><input id="s3Time" type="time"></div>
+              <div id="s3WeekdayField" class="field"><label for="s3Weekday">星期</label><select id="s3Weekday"><option value="0">周一</option><option value="1">周二</option><option value="2">周三</option><option value="3">周四</option><option value="4">周五</option><option value="5">周六</option><option value="6">周日</option></select></div>
+              <div class="field"><label for="s3Retention">保留份数</label><input id="s3Retention" type="number" min="1" max="365"></div>
+              <label class="check-row"><input id="s3IncludeState" type="checkbox">包含运行状态</label>
+              <label class="check-row"><input id="s3IncludeLogs" type="checkbox">包含日志</label>
+              <div class="field"><label for="s3Notification">Telegram 通知</label><select id="s3Notification"><option value="errors">仅失败</option><option value="always">成功和失败</option><option value="none">不通知</option></select></div>
+              <div class="field"><label for="s3Encryption">服务端加密</label><select id="s3Encryption"><option value="AES256">SSE-S3</option><option value="aws:kms">SSE-KMS</option><option value="">关闭</option></select></div>
+              <div id="s3KmsField" class="field wide"><label for="s3KmsKey">KMS Key ID / ARN</label><input id="s3KmsKey" type="password" autocomplete="off"></div>
+              <div id="s3Result" class="inline-result wide" hidden></div>
+            </div>
+            <div class="panel-actions"><button id="s3TestButton" class="button secondary" type="button"><span data-icon="gauge"></span>测试连接</button><button id="s3RunButton" class="button secondary" type="button"><span data-icon="upload"></span>立即备份</button><button id="s3ListButton" class="button secondary" type="button"><span data-icon="search"></span>云端备份</button><button class="button primary" type="submit"><span data-icon="save"></span>保存设置</button></div>
+            <div id="s3BackupList" class="node-list"></div>
+          </form>
+          <div class="panel full">
+            <div class="panel-head"><div><h2>程序版本回滚</h2><p>恢复更新前程序文件，不覆盖配置、状态和日志</p></div></div>
+            <div class="panel-body form-grid"><div class="field wide"><label for="rollbackSnapshot">程序快照</label><select id="rollbackSnapshot"></select></div></div>
+            <div class="panel-actions"><button id="rollbackButton" class="button warning" type="button" disabled><span data-icon="refresh-cw"></span>回滚并重启</button></div>
           </div>
         </div>
       </section>
@@ -3734,6 +7149,27 @@ __AG_WEB_PY_EOF__
     </form>
   </dialog>
 
+  <dialog id="discoveryDialog" class="wide-dialog">
+    <form id="discoveryForm">
+      <div class="dialog-head"><h2>自动发现阿里云 ECS</h2><button class="icon-button" type="button" data-close-dialog title="关闭" aria-label="关闭" data-icon="x"></button></div>
+      <div class="dialog-body">
+        <div class="form-grid">
+          <div class="field"><label for="discoverAk">AccessKey ID</label><input id="discoverAk" type="password" autocomplete="off" required></div>
+          <div class="field"><label for="discoverSk">AccessKey Secret</label><input id="discoverSk" type="password" autocomplete="off" required></div>
+          <div class="field wide"><label for="discoverRegions">Region ID（逗号分隔）</label><input id="discoverRegions" placeholder="留空扫描内置 Region"></div>
+          <div class="field"><label for="discoverTagKey">标签键</label><input id="discoverTagKey" placeholder="可留空"></div>
+          <div class="field"><label for="discoverTagValue">标签值</label><input id="discoverTagValue" placeholder="可留空"></div>
+          <div class="field"><label for="discoverLimit">统一关机阈值（GB）</label><input id="discoverLimit" type="number" min="0.01" step="0.01" value="180" required></div>
+          <div class="field"><label for="discoverBillingSite">账单站点</label><select id="discoverBillingSite"><option value="china">阿里云中国站</option><option value="international">阿里云国际站</option></select></div>
+          <label class="check-row wide"><input id="discoverActions" type="checkbox" checked>允许导入的实例自动开关机</label>
+        </div>
+        <div id="discoveryResult" class="inline-result" hidden></div>
+        <div id="discoveryList" class="node-list"></div>
+      </div>
+      <div class="dialog-actions"><button class="button secondary" type="button" data-close-dialog>取消</button><button id="scanInstancesButton" class="button secondary" type="button"><span data-icon="search"></span>扫描实例</button><button id="importInstancesButton" class="button primary" type="submit" disabled><span data-icon="plus"></span>导入所选</button></div>
+    </form>
+  </dialog>
+
   <div id="toast" class="toast" hidden role="status"><span id="toastIcon" data-icon="circle-check"></span><span id="toastText"></span></div>
 
   <script>
@@ -3762,6 +7198,7 @@ __AG_WEB_PY_EOF__
       "gauge": '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
       "search": '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
       "download": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/>',
+      "upload": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
       "pencil": '<path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4Z"/>',
       "trash-2": '<path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" x2="10" y1="11" y2="17"/><line x1="14" x2="14" y1="11" y2="17"/>',
       "shield-check": '<path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3z"/><path d="m9 12 2 2 4-4"/>',
@@ -3772,7 +7209,7 @@ __AG_WEB_PY_EOF__
     const icon = (name, className = "") => `<svg class="icon ${className}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[name] || ICONS.activity}</svg>`;
     document.querySelectorAll("[data-icon]").forEach(el => { el.innerHTML = icon(el.dataset.icon); });
 
-    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null };
+    const state = { csrf: null, dashboard: null, management: null, logs: null, scheduleIndex: null, instanceIndex: null, timer: null, update: null, updatePolling: false, restoreBackupBase64: null, restorePreviewReady: false, s3RestoreKey: null, s3RestorePreviewReady: false, discoveredInstances: [], discoveryCredentials: null };
     const $ = id => document.getElementById(id);
     const esc = value => String(value ?? "").replace(/[&<>'"]/g, char => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[char]));
     const fmtDate = value => value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "尚未运行";
@@ -3821,7 +7258,7 @@ __AG_WEB_PY_EOF__
       $("appView").hidden = false;
       loadDashboard();
       loadManagement();
-      checkForUpdate(false);
+      resumeUpdateProgress().then(running => { if (!running) checkForUpdate(false); });
       clearInterval(state.timer);
       state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
     }
@@ -3929,13 +7366,19 @@ __AG_WEB_PY_EOF__
       $("logSource").innerHTML = '<option value="system">系统总日志</option>' + data.instances.map(item => `<option value="${item.index}">${esc(item.name)} (${esc(item.instance_id)}) · ${item.instance_log_enabled ? "已启用" : "已关闭"}</option>`).join("");
       $("logSource").value = Array.from($("logSource").options).some(option => option.value === selectedLogSource) ? selectedLogSource : "system";
       const telegram = data.telegram;
-      $("telegramCurrent").textContent = `当前：${telegram.connection_description}`;
+      $("telegramCurrent").textContent = `当前：${telegram.connection_description} · Bot 控制${telegram.control_enabled ? "已开启" : "已关闭"}`;
       $("connectionDescription").textContent = telegram.connection_description;
       $("tgToken").value = "";
       $("tgToken").placeholder = telegram.bot_token_configured ? "已保存，留空不修改" : "尚未保存，请输入 Bot Token";
       $("tgChatId").value = telegram.chat_id;
       $("tgTimeout").value = telegram.timeout_seconds;
       $("tgRetries").value = telegram.retries;
+      $("tgControlEnabled").checked = telegram.control_enabled;
+      $("tgControlAdmins").value = telegram.control_admin_ids.join(",");
+      $("tgControlHint").textContent = telegram.control_effective_admin_ids.length
+        ? `当前授权：${telegram.control_effective_admin_ids.join(", ")}${telegram.control_uses_chat_id ? "（使用 Chat ID）" : ""}`
+        : "当前没有有效管理员，Bot 不会接受控制命令";
+      updateTelegramControlFields();
       const mode = document.querySelector(`input[name="connectionMode"][value="${telegram.connection_mode}"]`) || document.querySelector('input[name="connectionMode"][value="direct"]');
       mode.checked = true;
       $("proxyUrl").value = "";
@@ -3955,6 +7398,9 @@ __AG_WEB_PY_EOF__
       $("startWait").value = settings.start_wait_seconds;
       $("stopWait").value = settings.stop_wait_seconds;
       $("pollSeconds").value = settings.start_poll_seconds;
+      $("watchdogEnabled").checked = settings.watchdog.enabled;
+      $("watchdogTimeout").value = settings.watchdog.timeout_seconds;
+      $("watchdogFailures").value = settings.watchdog.failure_threshold;
 
       const web = data.web;
       $("webEnabled").checked = web.enabled;
@@ -3970,6 +7416,74 @@ __AG_WEB_PY_EOF__
       $("systemBrowserUrl").textContent = web.browser_url;
       $("systemCurrentVersion").textContent = `v${data.version}`;
       $("updateCurrentVersion").textContent = `v${data.version}`;
+      $("rollbackSnapshot").innerHTML = data.rollback_snapshots.length ? data.rollback_snapshots.map(item => `<option value="${esc(item.name)}">${esc(item.name)} · ${Math.ceil(item.size / 1024)} KiB</option>`).join("") : '<option value="">没有可用快照</option>';
+      $("rollbackButton").disabled = !data.rollback_snapshots.length;
+      const s3 = data.s3_backup;
+      $("s3Enabled").checked = s3.enabled;
+      $("s3Bucket").value = s3.bucket;
+      $("s3Region").value = s3.region;
+      $("s3Endpoint").value = s3.endpoint_url;
+      $("s3Prefix").value = s3.prefix;
+      $("s3AddressingStyle").value = s3.addressing_style;
+      $("s3IamRole").checked = s3.uses_iam_role;
+      $("s3AccessKey").value = "";
+      $("s3SecretKey").value = "";
+      $("s3SessionToken").value = "";
+      $("s3ClearSessionToken").checked = false;
+      $("s3BackupPassword").value = "";
+      $("s3KmsKey").value = "";
+      $("s3AccessKey").placeholder = s3.access_key_configured ? "已保存，留空不修改" : "请输入 Access Key ID";
+      $("s3SecretKey").placeholder = s3.access_key_configured ? "已保存，留空不修改" : "请输入 Secret Access Key";
+      $("s3SessionToken").placeholder = s3.session_token_configured ? "已保存，留空不修改" : "长期密钥留空";
+      $("s3BackupPassword").placeholder = s3.backup_password_configured ? "已保存，留空不修改" : "至少 8 个字符";
+      $("s3Schedule").value = s3.schedule;
+      $("s3Time").value = s3.time;
+      $("s3Weekday").value = String(s3.weekday);
+      $("s3Retention").value = s3.retention;
+      $("s3IncludeState").checked = s3.include_state;
+      $("s3IncludeLogs").checked = s3.include_logs;
+      $("s3Notification").value = s3.notification_mode;
+      $("s3Encryption").value = s3.server_side_encryption;
+      $("s3KmsKey").placeholder = s3.kms_key_configured ? "已保存，留空不修改" : "请输入 KMS Key ID 或 ARN";
+      $("s3BackupStatus").textContent = s3.enabled ? `已启用 · 最近成功 ${fmtDate(s3.status.last_success_at)}` : "已关闭";
+      setInlineResult($("s3Result"), s3.status.last_error ? `最近失败：${s3.status.last_error}` : "", Boolean(s3.status.last_error));
+      updateS3Fields();
+    }
+
+    function downloadBase64(filename, encoded) {
+      const bytes = Uint8Array.from(atob(encoded), char => char.charCodeAt(0));
+      const url = URL.createObjectURL(new Blob([bytes], { type: "application/json" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    }
+
+    function fileAsBase64(file) {
+      return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onerror = () => reject(new Error("无法读取备份文件"));
+        reader.onload = () => resolve(String(reader.result).split(",", 2)[1] || "");
+        reader.readAsDataURL(file);
+      });
+    }
+
+    function discoveryPayload() {
+      return {
+        ak: $("discoverAk").value.trim(),
+        sk: $("discoverSk").value.trim(),
+        regions: $("discoverRegions").value.trim(),
+        tag_key: $("discoverTagKey").value.trim(),
+        tag_value: $("discoverTagValue").value.trim(),
+      };
+    }
+
+    function renderDiscoveredInstances(items) {
+      $("discoveryList").innerHTML = items.length ? items.map((item, index) => `<label class="node-row"><input type="checkbox" data-discovery-index="${index}" ${item.already_configured ? "disabled" : "checked"}><div><div class="node-name">${esc(item.name)} · ${esc(item.status)}</div><div class="muted small">${esc(item.region)} · ${esc(item.instance_id)}${item.public_ip ? ` · ${esc(item.public_ip)}` : ""}${item.already_configured ? " · 已配置" : ""}</div></div></label>`).join("") : '<div class="node-row muted">没有发现符合条件的 ECS</div>';
+      $("importInstancesButton").disabled = !items.some(item => !item.already_configured);
     }
 
     async function loadDashboard(showErrors = true) {
@@ -4011,6 +7525,10 @@ __AG_WEB_PY_EOF__
       $("apiProxyField").hidden = mode !== "api_proxy";
     }
 
+    function updateTelegramControlFields() {
+      $("tgControlAdminsField").hidden = !$("tgControlEnabled").checked;
+    }
+
     function connectionPayload(save) {
       const mode = currentConnectionMode();
       const body = { connection_mode: mode, save };
@@ -4028,6 +7546,49 @@ __AG_WEB_PY_EOF__
       const publicHttp = $("webHost").value === "0.0.0.0";
       $("webWarning").textContent = publicHttp ? "所有网卡监听允许直接 HTTP 访问，用户名和密码会以明文经过网络；建议配置防火墙或 HTTPS 反向代理。" : "仅本机监听适合 SSH 隧道或 HTTPS 反向代理。";
       $("webWarning").classList.toggle("warning-text", publicHttp);
+    }
+
+    function updateS3Fields() {
+      $("s3CredentialFields").hidden = $("s3IamRole").checked;
+      $("s3WeekdayField").hidden = $("s3Schedule").value !== "weekly";
+      $("s3KmsField").hidden = $("s3Encryption").value !== "aws:kms";
+    }
+
+    function s3SettingsPayload() {
+      return {
+        enabled: $("s3Enabled").checked,
+        bucket: $("s3Bucket").value.trim(),
+        region: $("s3Region").value.trim(),
+        endpoint_url: $("s3Endpoint").value.trim(),
+        prefix: $("s3Prefix").value.trim(),
+        addressing_style: $("s3AddressingStyle").value,
+        use_iam_role: $("s3IamRole").checked,
+        access_key_id: $("s3AccessKey").value.trim(),
+        secret_access_key: $("s3SecretKey").value.trim(),
+        session_token: $("s3SessionToken").value.trim(),
+        clear_session_token: $("s3ClearSessionToken").checked,
+        backup_password: $("s3BackupPassword").value,
+        schedule: $("s3Schedule").value,
+        time: $("s3Time").value,
+        weekday: Number($("s3Weekday").value),
+        retention: Number($("s3Retention").value),
+        include_state: $("s3IncludeState").checked,
+        include_logs: $("s3IncludeLogs").checked,
+        notification_mode: $("s3Notification").value,
+        server_side_encryption: $("s3Encryption").value,
+        kms_key_id: $("s3KmsKey").value.trim(),
+      };
+    }
+
+    async function loadS3Backups() {
+      $("s3ListButton").disabled = true;
+      setInlineResult($("s3Result"), "正在读取云端备份...");
+      try {
+        const data = await api("/api/s3-backup/list");
+        $("s3BackupList").innerHTML = data.backups.length ? data.backups.map(item => `<div class="node-row" data-s3-key="${esc(item.key)}"><div><div class="node-name">${esc(item.name)}</div><div class="muted small">${(item.size / 1048576).toFixed(2)} MiB · ${esc(fmtDate(item.modified_at))}</div></div><div class="node-actions"><button class="button secondary" type="button" data-s3-action="preview">${icon("search")}预览</button><button class="button warning" type="button" data-s3-action="restore">${icon("refresh-cw")}恢复</button></div></div>`).join("") : '<div class="node-row muted">云端没有 Aliyun Guard 加密备份</div>';
+        setInlineResult($("s3Result"), `已读取 ${data.backups.length} 份云端备份`);
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { $("s3ListButton").disabled = false; }
     }
 
     function billingFieldsVisibility() {
@@ -4292,16 +7853,166 @@ __AG_WEB_PY_EOF__
           start_wait_seconds: Number($("startWait").value),
           stop_wait_seconds: Number($("stopWait").value),
           start_poll_seconds: Number($("pollSeconds").value),
+          watchdog: { enabled: $("watchdogEnabled").checked, timeout_seconds: Number($("watchdogTimeout").value), failure_threshold: Number($("watchdogFailures").value) },
         } });
         toast("全局设置已保存");
         await Promise.all([loadDashboard(), loadManagement()]);
       } catch (error) { toast(error.message, true); }
     });
 
+    $("backupCreateForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const button = event.currentTarget.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        const data = await api("/api/backup/create", { method: "POST", body: { password: $("backupPassword").value, include_state: $("backupState").checked, include_logs: $("backupLogs").checked } });
+        downloadBase64(data.result.filename, data.result.backup_base64);
+        $("backupPassword").value = "";
+        toast(`加密备份已创建：${data.result.filename}`);
+      } catch (error) { toast(error.message, true); }
+      finally { button.disabled = false; }
+    });
+
+    $("restoreFile").addEventListener("change", () => { state.restorePreviewReady = false; state.restoreBackupBase64 = null; $("restoreBackupButton").disabled = true; setInlineResult($("restorePreview"), ""); });
+    $("restorePassword").addEventListener("input", () => { state.restorePreviewReady = false; $("restoreBackupButton").disabled = true; });
+    $("previewRestoreButton").addEventListener("click", async () => {
+      const file = $("restoreFile").files[0];
+      if (!file) return toast("请选择备份文件", true);
+      $("previewRestoreButton").disabled = true;
+      try {
+        state.restoreBackupBase64 = await fileAsBase64(file);
+        const data = await api("/api/backup/preview", { method: "POST", body: { backup_base64: state.restoreBackupBase64, password: $("restorePassword").value } });
+        const changed = data.result.files.filter(item => item.action !== "unchanged");
+        setInlineResult($("restorePreview"), `备份包含 ${data.result.summary.instances || 0} 个实例、${data.result.summary.nodes || 0} 个节点；${changed.length} 个文件将新增或替换：${changed.map(item => item.path).join("、") || "无变化"}`);
+        state.restorePreviewReady = true;
+        $("restoreBackupButton").disabled = false;
+      } catch (error) { state.restorePreviewReady = false; $("restoreBackupButton").disabled = true; setInlineResult($("restorePreview"), error.message, true); }
+      finally { $("previewRestoreButton").disabled = false; }
+    });
+    $("backupRestoreForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      if (!state.restorePreviewReady || !state.restoreBackupBase64) return;
+      if (!confirm("确认按预览结果恢复？当前配置会先自动创建安全备份。")) return;
+      try {
+        await api("/api/backup/restore", { method: "POST", body: { backup_base64: state.restoreBackupBase64, password: $("restorePassword").value, include_logs: $("restoreLogs").checked } });
+        toast("备份已恢复，后台服务即将重启");
+        state.restorePreviewReady = false;
+        $("restoreBackupButton").disabled = true;
+      } catch (error) { toast(error.message, true); }
+    });
+    $("s3IamRole").addEventListener("change", updateS3Fields);
+    $("s3Schedule").addEventListener("change", updateS3Fields);
+    $("s3Encryption").addEventListener("change", updateS3Fields);
+    $("s3BackupForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      const button = event.currentTarget.querySelector('button[type="submit"]');
+      button.disabled = true;
+      try {
+        await api("/api/s3-backup/settings", { method: "POST", body: s3SettingsPayload() });
+        toast("S3 自动备份设置已保存");
+        await loadManagement(false);
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { button.disabled = false; }
+    });
+    $("s3TestButton").addEventListener("click", async () => {
+      $("s3TestButton").disabled = true;
+      setInlineResult($("s3Result"), "正在测试 S3 连接...");
+      try {
+        const data = await api("/api/s3-backup/test", { method: "POST", body: s3SettingsPayload() });
+        setInlineResult($("s3Result"), `连接成功：${data.result.bucket} · ${data.result.endpoint} · ${data.result.latency_ms} ms`);
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { $("s3TestButton").disabled = false; }
+    });
+    $("s3RunButton").addEventListener("click", async () => {
+      if (!confirm("立即使用已保存的 S3 设置创建并上传一份加密备份？")) return;
+      $("s3RunButton").disabled = true;
+      setInlineResult($("s3Result"), "正在创建加密备份并上传...");
+      try {
+        const data = await api("/api/s3-backup/run", { method: "POST", body: {} });
+        setInlineResult($("s3Result"), `上传成功：s3://${data.result.bucket}/${data.result.key}；清理 ${data.result.deleted.length} 份旧备份`);
+        await loadS3Backups();
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); }
+      finally { $("s3RunButton").disabled = false; }
+    });
+    $("s3ListButton").addEventListener("click", loadS3Backups);
+    $("s3BackupList").addEventListener("click", async event => {
+      const button = event.target.closest("[data-s3-action]");
+      const row = button?.closest("[data-s3-key]");
+      if (!button || !row) return;
+      const key = row.dataset.s3Key;
+      if (button.dataset.s3Action === "preview") {
+        button.disabled = true;
+        setInlineResult($("s3Result"), "正在下载并验证云端备份...");
+        try {
+          const data = await api("/api/s3-backup/preview", { method: "POST", body: { key } });
+          const changed = data.result.files.filter(item => item.action !== "unchanged");
+          state.s3RestoreKey = key;
+          state.s3RestorePreviewReady = true;
+          setInlineResult($("s3Result"), `已预览 ${row.querySelector(".node-name").textContent}：${data.result.summary.instances || 0} 个实例，${changed.length} 个文件将新增或替换：${changed.map(item => item.path).join("、") || "无变化"}`);
+        } catch (error) { state.s3RestoreKey = null; state.s3RestorePreviewReady = false; setInlineResult($("s3Result"), error.message, true); }
+        finally { button.disabled = false; }
+        return;
+      }
+      if (!state.s3RestorePreviewReady || state.s3RestoreKey !== key) {
+        setInlineResult($("s3Result"), "请先预览这份云端备份，再执行恢复。", true);
+        return;
+      }
+      if (!confirm("确认按刚才的差异预览恢复这份云端备份？当前配置会先自动创建安全备份。")) return;
+      button.disabled = true;
+      try {
+        await api("/api/s3-backup/restore", { method: "POST", body: { key, include_logs: true } });
+        state.s3RestorePreviewReady = false;
+        state.s3RestoreKey = null;
+        toast("云端备份已恢复，后台服务即将重启");
+      } catch (error) { setInlineResult($("s3Result"), error.message, true); button.disabled = false; }
+    });
+    $("rollbackButton").addEventListener("click", async () => {
+      const snapshot = $("rollbackSnapshot").value;
+      if (!snapshot || !confirm(`确认回滚到 ${snapshot}？配置、状态和日志不会改变。`)) return;
+      $("rollbackButton").disabled = true;
+      try { await api("/api/rollback", { method: "POST", body: { snapshot } }); toast("程序已回滚，后台服务即将重启"); }
+      catch (error) { toast(error.message, true); $("rollbackButton").disabled = false; }
+    });
+
+    $("discoverInstanceButton").addEventListener("click", () => {
+      state.discoveredInstances = [];
+      state.discoveryCredentials = null;
+      $("discoverAk").value = ""; $("discoverSk").value = "";
+      renderDiscoveredInstances([]);
+      setInlineResult($("discoveryResult"), "");
+      $("discoveryDialog").showModal();
+    });
+    $("scanInstancesButton").addEventListener("click", async () => {
+      const credentials = discoveryPayload();
+      $("scanInstancesButton").disabled = true;
+      setInlineResult($("discoveryResult"), "正在跨 Region 扫描 ECS...");
+      try {
+        const data = await api("/api/discovery/scan", { method: "POST", body: credentials });
+        state.discoveredInstances = data.result.instances;
+        state.discoveryCredentials = { ak: credentials.ak, sk: credentials.sk };
+        renderDiscoveredInstances(state.discoveredInstances);
+        setInlineResult($("discoveryResult"), `发现 ${data.result.instances.length} 台 ECS；${data.result.errors.length} 个 Region 扫描失败`, Boolean(data.result.errors.length));
+      } catch (error) { setInlineResult($("discoveryResult"), error.message, true); }
+      finally { $("scanInstancesButton").disabled = false; }
+    });
+    $("discoveryForm").addEventListener("submit", async event => {
+      event.preventDefault();
+      if (!state.discoveryCredentials) return;
+      const selected = Array.from(document.querySelectorAll("[data-discovery-index]:checked")).map(input => state.discoveredInstances[Number(input.dataset.discoveryIndex)]);
+      if (!selected.length) return toast("请选择至少一个实例", true);
+      $("importInstancesButton").disabled = true;
+      try {
+        const data = await api("/api/discovery/import", { method: "POST", body: { ...state.discoveryCredentials, instances: selected, traffic_limit_gb: Number($("discoverLimit").value), actions_enabled: $("discoverActions").checked, billing_site: $("discoverBillingSite").value } });
+        $("discoveryDialog").close();
+        toast(`已导入 ${data.result.count} 台 ECS`);
+        await Promise.all([loadDashboard(), loadManagement()]);
+      } catch (error) { toast(error.message, true); $("importInstancesButton").disabled = false; }
+    });
+
     $("telegramIdentityForm").addEventListener("submit", async event => {
       event.preventDefault();
       try {
-        await api("/api/telegram/identity", { method: "POST", body: { bot_token: $("tgToken").value.trim(), chat_id: $("tgChatId").value.trim(), timeout_seconds: Number($("tgTimeout").value), retries: Number($("tgRetries").value) } });
+        await api("/api/telegram/identity", { method: "POST", body: { bot_token: $("tgToken").value.trim(), chat_id: $("tgChatId").value.trim(), timeout_seconds: Number($("tgTimeout").value), retries: Number($("tgRetries").value), control_enabled: $("tgControlEnabled").checked, control_admin_ids: $("tgControlAdmins").value.trim() } });
         $("tgToken").value = "";
         toast("Telegram 机器人配置已保存");
         await loadManagement();
@@ -4316,6 +8027,7 @@ __AG_WEB_PY_EOF__
     });
 
     document.querySelectorAll('input[name="connectionMode"]').forEach(input => input.addEventListener("change", updateConnectionFields));
+    $("tgControlEnabled").addEventListener("change", updateTelegramControlFields);
     async function submitConnection(save) {
       const target = $("connectionResult");
       setInlineResult(target, "正在连接 Telegram Bot API...");
@@ -4389,13 +8101,92 @@ __AG_WEB_PY_EOF__
       } catch (error) {
         setInlineResult($("updateResult"), error.message, true);
         if (showErrors) toast(error.message, true);
-      } finally { $("checkUpdateButton").disabled = false; }
+      } finally { $("checkUpdateButton").disabled = state.updatePolling; }
     }
+
+    function renderUpdateProgress(progress, message, isError = false) {
+      const value = Math.max(0, Math.min(100, Number(progress) || 0));
+      $("updateProgress").hidden = false;
+      $("updateProgress").classList.toggle("error", isError);
+      $("updateProgressBar").value = value;
+      $("updateProgressBar").setAttribute("aria-valuenow", String(value));
+      $("updateProgressText").textContent = message || "正在更新";
+      $("updateProgressPercent").textContent = `${Math.round(value)}%`;
+    }
+
+    async function readUpdateProgress() {
+      const response = await fetch("/api/update/progress", { headers: { "Accept": "application/json" }, cache: "no-store" });
+      if (!response.ok) throw new Error(`进度接口暂不可用 (${response.status})`);
+      return response.json();
+    }
+
+    async function pollUpdateProgress() {
+      if (state.updatePolling) return;
+      state.updatePolling = true;
+      $("checkUpdateButton").disabled = true;
+      $("installUpdateButton").disabled = true;
+      let lastProgress = Number($("updateProgressBar").value) || 3;
+      while (state.updatePolling) {
+        try {
+          const data = await readUpdateProgress();
+          lastProgress = Math.max(lastProgress, Number(data.progress) || 0);
+          renderUpdateProgress(lastProgress, data.message, data.status === "error");
+          if (data.status === "success") {
+            state.updatePolling = false;
+            setInlineResult($("updateResult"), `已更新到 v${data.target_version || state.update?.latest_version || "最新版本"}`);
+            toast("更新完成，正在重新加载网页");
+            setTimeout(() => window.location.reload(), 1600);
+            return;
+          }
+          if (data.status === "error") {
+            state.updatePolling = false;
+            setInlineResult($("updateResult"), `${data.message}；请查看 /opt/aliyun-guard/logs/web-update.log`, true);
+            toast("更新失败，已保留当前版本", true);
+            $("checkUpdateButton").disabled = false;
+            loadDashboard(false);
+            state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
+            return;
+          }
+        } catch (_) {
+          lastProgress = Math.max(lastProgress, 86);
+          renderUpdateProgress(lastProgress, "后台服务重启中，正在重新连接...");
+        }
+        await new Promise(resolve => setTimeout(resolve, 1000));
+      }
+    }
+
+    async function resumeUpdateProgress() {
+      try {
+        const data = await readUpdateProgress();
+        if (data.status === "running") {
+          renderUpdateProgress(data.progress, data.message);
+          pollUpdateProgress();
+          return true;
+        }
+      } catch (_) {}
+      return false;
+    }
+
     $("checkUpdateButton").addEventListener("click", () => checkForUpdate(true));
     $("installUpdateButton").addEventListener("click", async () => {
       if (!state.update?.available || !confirm(`确认更新到 v${state.update.latest_version}？本机配置和节点会保留。`)) return;
-      try { await api("/api/update/install", { method: "POST", body: {} }); toast("更新程序已启动，完成后后台服务会重新加载"); $("installUpdateButton").disabled = true; }
-      catch (error) { toast(error.message, true); }
+      renderUpdateProgress(2, "正在提交更新任务");
+      $("checkUpdateButton").disabled = true;
+      $("installUpdateButton").disabled = true;
+      clearInterval(state.timer);
+      state.timer = null;
+      try {
+        await api("/api/update/install", { method: "POST", body: { target_version: state.update.latest_version } });
+        toast("更新程序已启动");
+        pollUpdateProgress();
+      } catch (error) {
+        renderUpdateProgress(0, error.message, true);
+        setInlineResult($("updateResult"), error.message, true);
+        $("checkUpdateButton").disabled = false;
+        $("installUpdateButton").disabled = false;
+        state.timer = setInterval(() => { if (!document.hidden) loadDashboard(false); }, 15000);
+        toast(error.message, true);
+      }
     });
     $("restartServiceButton").addEventListener("click", async () => {
       if (!confirm("确认重启后台服务？网页可能短暂断开。")) return;
@@ -4441,6 +8232,7 @@ except ImportError as exc:
     REQUESTS_IMPORT_ERROR = exc
 
 import telegram_proxy
+import s3_backup
 
 try:
     import fcntl
@@ -4467,6 +8259,9 @@ APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().pare
 CONFIG_FILE = Path(os.environ.get("ALIYUN_GUARD_CONFIG", APP_DIR / "config.json"))
 STATE_FILE = Path(os.environ.get("ALIYUN_GUARD_STATE", APP_DIR / "state.json"))
 LOCK_FILE = Path(os.environ.get("ALIYUN_GUARD_LOCK", APP_DIR / "cycle.lock"))
+HEARTBEAT_FILE = Path(
+    os.environ.get("ALIYUN_GUARD_HEARTBEAT", APP_DIR / "heartbeat.json")
+)
 LOG_DIR = Path(os.environ.get("ALIYUN_GUARD_LOG_DIR", APP_DIR / "logs"))
 LOG_FILE = LOG_DIR / "guard.log"
 
@@ -4494,10 +8289,18 @@ DEFAULT_CONFIG = {
         "node_url": "",
         "node_urls": [],
         "api_base_url": "https://api.telegram.org",
+        "control_enabled": True,
+        "control_admin_ids": [],
     },
     "start_wait_seconds": 90,
     "stop_wait_seconds": 45,
     "start_poll_seconds": 5,
+    "watchdog": {
+        "enabled": True,
+        "timeout_seconds": 600,
+        "failure_threshold": 2,
+    },
+    "s3_backup": dict(s3_backup.DEFAULT_CONFIG),
     "users": [],
 }
 
@@ -4575,6 +8378,45 @@ def telegram_node_urls(telegram):
     return nodes
 
 
+def normalize_telegram_control_admin_ids(value):
+    if value in (None, ""):
+        return []
+    if isinstance(value, str):
+        values = [item for item in re.split(r"[\s,;]+", value.strip()) if item]
+    elif isinstance(value, (list, tuple)):
+        values = list(value)
+    else:
+        raise GuardError("Telegram Bot 管理员用户 ID 必须是数组或分隔文本")
+    if len(values) > 20:
+        raise GuardError("Telegram Bot 管理员用户 ID 最多配置 20 个")
+    result = []
+    for raw in values:
+        if isinstance(raw, bool):
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        try:
+            user_id = int(str(raw).strip())
+        except (TypeError, ValueError):
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        if user_id <= 0:
+            raise GuardError("Telegram Bot 管理员用户 ID 必须是正整数")
+        if user_id not in result:
+            result.append(user_id)
+    return result
+
+
+def telegram_control_admin_ids(telegram):
+    configured = normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", []) if isinstance(telegram, dict) else []
+    )
+    if configured:
+        return configured
+    try:
+        chat_id = int(str(telegram.get("chat_id", "") or "").strip())
+    except (TypeError, ValueError):
+        return []
+    return [chat_id] if chat_id > 0 else []
+
+
 def load_json(path, default):
     if not path.exists():
         return json.loads(json.dumps(default))
@@ -4619,6 +8461,20 @@ def save_state(state):
     atomic_write_json(STATE_FILE, state)
 
 
+def write_heartbeat(status="running", detail=None, now=None):
+    now = now or dt.datetime.now().astimezone()
+    value = {
+        "at": now.isoformat(timespec="seconds"),
+        "epoch": now.timestamp(),
+        "status": str(status or "running"),
+        "pid": os.getpid(),
+    }
+    if detail:
+        value["detail"] = str(detail)[:500]
+    atomic_write_json(HEARTBEAT_FILE, value)
+    return value
+
+
 def validate_config(config):
     try:
         interval = int(config.get("interval_seconds", 0))
@@ -4636,6 +8492,26 @@ def validate_config(config):
     mode = config.get("notification_mode")
     if mode not in ("always", "events", "errors"):
         raise GuardError("notification_mode 必须是 always、events 或 errors")
+    watchdog = config.get("watchdog", {})
+    if not isinstance(watchdog, dict):
+        raise GuardError("watchdog 必须是对象")
+    if "enabled" in watchdog and not isinstance(watchdog.get("enabled"), bool):
+        raise GuardError("watchdog.enabled 必须是布尔值")
+    try:
+        watchdog_timeout = int(watchdog.get("timeout_seconds", 600))
+        watchdog_failures = int(watchdog.get("failure_threshold", 2))
+    except (TypeError, ValueError):
+        raise GuardError("看门狗超时和连续失败次数必须是整数")
+    if watchdog_timeout < 120 or watchdog_timeout > 86400:
+        raise GuardError("看门狗超时必须在 120 到 86400 秒之间")
+    if watchdog_failures < 1 or watchdog_failures > 10:
+        raise GuardError("看门狗连续失败次数必须在 1 到 10 之间")
+    try:
+        config["s3_backup"] = s3_backup.validate_config(
+            config.get("s3_backup", {}), require_ready=None
+        )
+    except s3_backup.S3BackupError as exc:
+        raise GuardError(str(exc))
     try:
         import web_panel
     except ImportError as exc:
@@ -4700,6 +8576,11 @@ def validate_telegram_config(telegram):
         raise GuardError("Telegram 请求超时必须在 3 到 60 秒之间")
     if retries < 1 or retries > 5:
         raise GuardError("Telegram 重试次数必须在 1 到 5 之间")
+    if "control_enabled" in telegram and not isinstance(
+        telegram.get("control_enabled"), bool
+    ):
+        raise GuardError("Telegram Bot 控制开关必须是布尔值")
+    normalize_telegram_control_admin_ids(telegram.get("control_admin_ids", []))
     mode = str(telegram.get("connection_mode", "direct") or "direct").strip().lower()
     if mode not in ("direct", "socks5", "http", "node", "api_proxy"):
         raise GuardError("Telegram 连接方式无效")
@@ -5103,6 +8984,33 @@ def query_cdt_traffic_gb(user):
     return total_bytes / (1024.0 ** 3)
 
 
+def cdt_account_cache_key(user):
+    """Return an in-memory fingerprint for one configured credential pair."""
+    credentials = "{}\0{}".format(
+        str(user.get("ak", "") or "").strip(),
+        str(user.get("sk", "") or "").strip(),
+    )
+    return hashlib.sha256(credentials.encode("utf-8")).digest()
+
+
+def query_cdt_traffic_gb_for_cycle(user, cycle_cache=None):
+    """Reuse one account-level CDT result within a single monitoring cycle."""
+    if cycle_cache is None:
+        return query_cdt_traffic_gb(user)
+
+    cache_key = cdt_account_cache_key(user)
+    if cache_key not in cycle_cache:
+        try:
+            cycle_cache[cache_key] = (query_cdt_traffic_gb(user), None)
+        except Exception as exc:
+            cycle_cache[cache_key] = (None, exc)
+
+    traffic_gb, error = cycle_cache[cache_key]
+    if error is not None:
+        raise error
+    return traffic_gb
+
+
 def query_instance_status(user):
     require_sdk()
     request = DescribeInstancesRequest()
@@ -5117,6 +9025,127 @@ def query_instance_status(user):
     if not instances:
         raise GuardError("区域 {} 中未找到实例 {}".format(user["region"], user["instance_id"]))
     return str(instances[0].get("Status", "Unknown"))
+
+
+def _instance_tags(instance):
+    raw = instance.get("Tags", {}).get("Tag", []) if isinstance(instance, dict) else []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raw = []
+    return {
+        str(item.get("TagKey", "")): str(item.get("TagValue", ""))
+        for item in raw
+        if isinstance(item, dict) and str(item.get("TagKey", ""))
+    }
+
+
+def discover_ecs_regions(ak, sk):
+    require_sdk()
+    access_key = str(ak or "").strip()
+    secret_key = str(sk or "").strip()
+    if not access_key or not secret_key:
+        raise GuardError("AccessKey ID 和 AccessKey Secret 不能为空")
+    request = CommonRequest()
+    request.set_protocol_type("https")
+    request.set_accept_format("json")
+    request.set_method("POST")
+    request.set_domain("ecs.aliyuncs.com")
+    request.set_version("2014-05-26")
+    request.set_action_name("DescribeRegions")
+    request.set_connect_timeout(5000)
+    request.set_read_timeout(15000)
+    credentials = {"ak": access_key, "sk": secret_key}
+    response = make_client(credentials, "cn-hangzhou").do_action_with_exception(request)
+    data = json.loads(response.decode("utf-8"))
+    regions = data.get("Regions", {}).get("Region", [])
+    if isinstance(regions, dict):
+        regions = [regions]
+    if not isinstance(regions, list):
+        raise GuardError("ECS 返回 Region 列表格式无法识别")
+    result = []
+    for item in regions:
+        region = str(item.get("RegionId", "") if isinstance(item, dict) else "").strip()
+        if region and region not in result:
+            result.append(region)
+    return result
+
+
+def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
+    require_sdk()
+    access_key = str(ak or "").strip()
+    secret_key = str(sk or "").strip()
+    if not access_key or not secret_key:
+        raise GuardError("AccessKey ID 和 AccessKey Secret 不能为空")
+    region_values = []
+    for value in regions if isinstance(regions, (list, tuple)) else [regions]:
+        region = str(value or "").strip()
+        if region and region not in region_values:
+            region_values.append(region)
+    if not region_values:
+        raise GuardError("至少需要一个 Region ID")
+    if len(region_values) > 50:
+        raise GuardError("一次最多扫描 50 个 Region")
+    tag_key = str(tag_key or "").strip()
+    tag_value = str(tag_value or "").strip()
+    results = []
+    errors = []
+    credentials = {"ak": access_key, "sk": secret_key}
+    for region in region_values:
+        try:
+            page = 1
+            while page <= 100:
+                request = DescribeInstancesRequest()
+                request.set_protocol_type("https")
+                request.set_accept_format("json")
+                request.set_PageNumber(page)
+                request.set_PageSize(100)
+                request.set_connect_timeout(5000)
+                request.set_read_timeout(20000)
+                response = make_client(credentials, region).do_action_with_exception(request)
+                data = json.loads(response.decode("utf-8"))
+                instances = data.get("Instances", {}).get("Instance", [])
+                if isinstance(instances, dict):
+                    instances = [instances]
+                if not isinstance(instances, list):
+                    raise GuardError("ECS 返回实例列表格式无法识别")
+                for instance in instances:
+                    if not isinstance(instance, dict):
+                        continue
+                    tags = _instance_tags(instance)
+                    if tag_key and tag_key not in tags:
+                        continue
+                    if tag_key and tag_value and tags.get(tag_key) != tag_value:
+                        continue
+                    instance_id = str(instance.get("InstanceId", "")).strip()
+                    if not instance_id:
+                        continue
+                    results.append(
+                        {
+                            "region": region,
+                            "instance_id": instance_id,
+                            "name": str(instance.get("InstanceName", "") or instance_id),
+                            "status": str(instance.get("Status", "Unknown")),
+                            "zone_id": str(instance.get("ZoneId", "")),
+                            "instance_type": str(instance.get("InstanceType", "")),
+                            "public_ip": str(
+                                (instance.get("PublicIpAddress", {}).get("IpAddress", []) or [""])[0]
+                            ),
+                            "tags": tags,
+                        }
+                    )
+                total = int(data.get("TotalCount", len(instances)) or 0)
+                if page * 100 >= total or not instances:
+                    break
+                page += 1
+        except Exception as exc:
+            errors.append(
+                {
+                    "region": region,
+                    "error": compact_error(exc, secrets=(access_key, secret_key)),
+                }
+            )
+    return {"instances": results, "errors": errors, "regions": region_values}
 
 
 def start_instance(user):
@@ -5282,11 +9311,18 @@ def _telegram_post(url, data, timeout, proxies):
         return session.post(url, data=data, timeout=timeout, proxies=proxies)
 
 
-def telegram_api(config, method, data=None):
+def telegram_api(config, method, data=None, request_timeout=None):
     token = str(config.get("bot_token", "")).strip()
     if not token:
         raise GuardError("Telegram Bot Token 未配置")
-    timeout = max(3, int(config.get("timeout_seconds", 12)))
+    timeout = max(
+        3,
+        int(
+            request_timeout
+            if request_timeout is not None
+            else config.get("timeout_seconds", 12)
+        ),
+    )
     retries = max(1, min(5, int(config.get("retries", 3))))
     base_url, proxies = telegram_connection(config)
     url = "{}/bot{}/{}".format(base_url, token, method)
@@ -5399,7 +9435,14 @@ def wait_for_status(user, expected, timeout, poll_seconds):
     return latest, latest_error
 
 
-def check_one(user, config, dry_run=False, now=None, scheduled_action=None):
+def check_one(
+    user,
+    config,
+    dry_run=False,
+    now=None,
+    scheduled_action=None,
+    cdt_cycle_cache=None,
+):
     name = str(user.get("name") or user.get("instance_id") or "未命名")
     billing = get_billing_config(user)
     schedule = get_schedule_config(user)
@@ -5437,7 +9480,7 @@ def check_one(user, config, dry_run=False, now=None, scheduled_action=None):
     user_secrets = (user.get("ak"), user.get("sk"))
 
     try:
-        result["traffic_gb"] = query_cdt_traffic_gb(user)
+        result["traffic_gb"] = query_cdt_traffic_gb_for_cycle(user, cdt_cycle_cache)
     except Exception as exc:
         message = "CDT 流量查询失败: {}".format(compact_error(exc, secrets=user_secrets))
         result["errors"].append(message)
@@ -5863,6 +9906,7 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
     if not isinstance(previous_instances, dict):
         previous_instances = {}
     results = []
+    cdt_cycle_cache = {}
     for user in config.get("users", []):
         if _STOP_EVENT.is_set():
             break
@@ -5876,6 +9920,7 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
             dry_run=dry_run,
             now=started_at,
             scheduled_action=transition,
+            cdt_cycle_cache=cdt_cycle_cache,
         )
         results.append(result)
         write_instance_log(user, result, dry_run=dry_run)
@@ -5904,6 +9949,11 @@ def run_cycle(dry_run=False, no_notify=False, started_at=None):
         dry_run=dry_run,
     )
     save_state(previous_state)
+    if not dry_run:
+        write_heartbeat(
+            "cycle_error" if error_count else "cycle_ok",
+            "{} 个错误".format(error_count) if error_count else "检测完成",
+        )
     return 1 if error_count else 0
 
 
@@ -5925,18 +9975,21 @@ def is_due(config, state, now=None):
 def run_scheduled():
     if (APP_DIR / "disabled").exists():
         return 0
+    config = load_config()
+    now = dt.datetime.now().astimezone()
+    result = 0
     with cycle_lock() as locked:
         if not locked:
             LOGGER.info("已有检测正在运行，本次计划任务跳过")
-            return 0
-        config = load_config()
-        state = load_state()
-        now = dt.datetime.now().astimezone()
-        if not is_due(config, state, now.timestamp()) and not has_due_schedule(
-            config, state, now
-        ):
-            return 0
-        return run_cycle(started_at=now)
+        else:
+            write_heartbeat("scheduled", "计划任务已唤醒")
+            state = load_state()
+            if is_due(config, state, now.timestamp()) or has_due_schedule(
+                config, state, now
+            ):
+                result = run_cycle(started_at=now)
+    run_s3_backup_if_due(config, now)
+    return result
 
 
 def scheduler_wait_seconds(config, state, now=None):
@@ -5948,6 +10001,100 @@ def scheduler_wait_seconds(config, state, now=None):
         regular_wait = max(1.0, int(config["interval_seconds"]) - (now - float(last)))
     minute_wait = 60.05 - (now % 60.0)
     return max(1.0, min(regular_wait, minute_wait))
+
+
+def s3_backup_secrets(config):
+    backup = config.get("s3_backup", {}) if isinstance(config, dict) else {}
+    return tuple(
+        str(backup.get(field, "") or "")
+        for field in (
+            "access_key_id",
+            "secret_access_key",
+            "session_token",
+            "backup_password",
+        )
+        if str(backup.get(field, "") or "")
+    )
+
+
+def run_s3_backup_if_due(config, now=None):
+    backup = config.get("s3_backup", {})
+    if not isinstance(backup, dict) or not backup.get("enabled", False):
+        return None
+    now = now or dt.datetime.now().astimezone()
+    secrets = s3_backup_secrets(config)
+    heartbeat_stop = threading.Event()
+
+    def refresh_backup_heartbeat():
+        while not heartbeat_stop.wait(30):
+            try:
+                write_heartbeat("s3_backup", "S3 加密备份正在上传")
+            except Exception:
+                pass
+
+    write_heartbeat("s3_backup", "检查 S3 自动备份计划")
+    heartbeat_thread = threading.Thread(
+        target=refresh_backup_heartbeat,
+        name="aliyun-guard-s3-heartbeat",
+        daemon=True,
+    )
+    heartbeat_thread.start()
+    try:
+        try:
+            result = s3_backup.run_if_due(backup, CONFIG_FILE.parent, now=now)
+        except Exception as exc:
+            result = {"ok": False, "error": compact_error(exc, secrets=secrets)}
+    finally:
+        heartbeat_stop.set()
+        heartbeat_thread.join(timeout=2)
+        write_heartbeat("daemon_running", "S3 自动备份检查完成")
+    if result is None or result.get("skipped"):
+        return result
+    mode = str(backup.get("notification_mode", "errors"))
+    if result.get("ok"):
+        LOGGER.info(
+            "S3 自动备份成功: %s，清理 %s 份旧备份",
+            result.get("key"),
+            len(result.get("deleted", [])),
+        )
+        should_send = mode == "always"
+        text = (
+            "Aliyun Guard S3 自动备份成功\n"
+            "时间: {}\n"
+            "Bucket: {}\n"
+            "对象: {}\n"
+            "大小: {:.2f} MiB\n"
+            "清理旧备份: {} 份"
+        ).format(
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            result.get("bucket", ""),
+            result.get("key", ""),
+            float(result.get("size", 0)) / 1048576,
+            len(result.get("deleted", [])),
+        )
+    else:
+        LOGGER.error("S3 自动备份失败: %s", result.get("error", "未知错误"))
+        should_send = mode in ("always", "errors")
+        text = (
+            "Aliyun Guard S3 自动备份失败\n"
+            "时间: {}\n"
+            "错误: {}"
+        ).format(
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+            compact_error(result.get("error", "未知错误"), secrets=secrets),
+        )
+    if should_send:
+        try:
+            send_telegram_message(config.get("telegram", {}), text)
+        except Exception as exc:
+            LOGGER.error(
+                "S3 备份结果 Telegram 通知失败: %s",
+                compact_error(
+                    exc,
+                    secrets=telegram_secrets(config.get("telegram", {})) + secrets,
+                ),
+            )
+    return result
 
 
 def handle_stop(signum, frame):
@@ -5980,9 +10127,19 @@ def run_daemon():
         web_server = web_panel.start_background(sys.modules[__name__], config)
     except Exception as exc:
         LOGGER.error("网页控制面板启动失败，保活服务继续运行: %s", compact_error(exc))
+    telegram_control_service = None
+    try:
+        import telegram_control
+
+        telegram_control_service = telegram_control.start_background(sys.modules[__name__])
+    except Exception as exc:
+        LOGGER.error("Telegram Bot 控制启动失败，保活服务继续运行: %s", compact_error(exc))
     LOGGER.info("保活服务已启动")
+    write_heartbeat("daemon_started", "后台服务已启动")
     first_cycle = True
     while not _STOP_EVENT.is_set():
+        write_heartbeat("daemon_running", "调度循环正常")
+        now = dt.datetime.now().astimezone()
         with cycle_lock() as locked:
             if locked:
                 try:
@@ -6005,6 +10162,10 @@ def run_daemon():
                     )
             else:
                 LOGGER.warning("已有检测正在运行，本轮跳过")
+        try:
+            run_s3_backup_if_due(config, now)
+        except Exception as exc:
+            LOGGER.error("S3 自动备份调度失败: %s", compact_error(exc))
         first_cycle = False
         try:
             config = load_config()
@@ -6016,6 +10177,8 @@ def run_daemon():
     if web_server is not None:
         web_server.shutdown()
         web_server.server_close()
+    if telegram_control_service is not None:
+        telegram_control_service.shutdown()
     LOGGER.info("保活服务已停止")
     return 0
 
@@ -6029,6 +10192,15 @@ def show_status():
     state = load_state()
     print("配置状态: 正常")
     print("实例数量: {}".format(len(config.get("users", []))))
+    telegram = config.get("telegram", {})
+    control_enabled = bool(telegram.get("control_enabled", True))
+    control_admins = telegram_control_admin_ids(telegram) if control_enabled else []
+    print(
+        "Bot 控制: {}{}".format(
+            "已启用" if control_enabled else "已关闭",
+            "（{} 个管理员）".format(len(control_admins)) if control_enabled else "",
+        )
+    )
     scheduled_users = [
         user
         for user in config.get("users", [])
@@ -6151,6 +10323,8 @@ import urllib.parse
 import urllib.request
 
 import aliyun_guard as guard
+import backup_manager
+import s3_backup
 import telegram_proxy
 import web_panel
 
@@ -6158,16 +10332,25 @@ import web_panel
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 CONFIG_FILE = Path(os.environ.get("ALIYUN_GUARD_CONFIG", APP_DIR / "config.json"))
 CONTROL_FILE = APP_DIR / "control.sh"
-UPDATE_BASE_URL = os.environ.get(
-    "ALIYUN_GUARD_UPDATE_BASE",
-    "https://raw.githubusercontent.com/Felix666-ship-It/aliyun-guard/main",
-).rstrip("/")
-APP_VERSION = "1.5.0"
-LOCAL_RELEASE_ID = "ab32a0ca2ceecf6abba4245cd3f85da04aad01ca7b1154cbe69f2cc1471a0f23"
+UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
+UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
+UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
+UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
+APP_VERSION = "1.5.9"
+LOCAL_RELEASE_ID = "1ecb7ead2150b382e69df44e6590e2b4a891cfb42aca6810ff5299ed03ca1898"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
 ANSI_RESET = "\033[0m"
+
+
+def update_asset_base_url(version=None):
+    if UPDATE_CUSTOM_BASE_URL:
+        return UPDATE_CUSTOM_BASE_URL
+    if version:
+        normalized = str(version).strip().lstrip("v")
+        return UPDATE_RELEASES_URL + "/download/v" + normalized
+    return UPDATE_BASE_URL
 
 REGIONS = [
     ("cn-hongkong", "中国香港"),
@@ -6655,15 +10838,60 @@ def _set_telegram_identity(candidate):
     )
 
 
+def telegram_control_status(telegram):
+    if not telegram.get("control_enabled", True):
+        return "已关闭"
+    admins = guard.telegram_control_admin_ids(telegram)
+    explicit = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    if not admins:
+        return "已启用，但未配置有效管理员"
+    source = "独立名单" if explicit else "使用私聊 Chat ID"
+    return "已启用，{} 个管理员（{}）".format(len(admins), source)
+
+
+def configure_telegram_control(telegram):
+    title("Telegram Bot 控制")
+    print("当前状态: {}".format(telegram_control_status(telegram)))
+    enabled = yes_no(
+        "启用 Telegram Bot 控制", bool(telegram.get("control_enabled", True))
+    )
+    telegram["control_enabled"] = enabled
+    if not enabled:
+        print("Bot 控制已关闭，Telegram 通知不受影响。")
+        return telegram
+    explicit = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    default = ",".join(str(value) for value in explicit) if explicit else "auto"
+    raw = prompt(
+        "管理员 Telegram 用户 ID（逗号分隔；auto 使用私聊 Chat ID）",
+        default,
+        required=True,
+    )
+    if raw.strip().lower() == "auto":
+        telegram["control_admin_ids"] = []
+    else:
+        telegram["control_admin_ids"] = guard.normalize_telegram_control_admin_ids(raw)
+    admins = guard.telegram_control_admin_ids(telegram)
+    if admins:
+        print("Bot 控制管理员: {}".format(", ".join(str(value) for value in admins)))
+    else:
+        print("警告: 当前没有有效管理员，Bot 控制不会接受任何命令。")
+    return telegram
+
+
 def configure_telegram_connection(candidate, force_ipv4=True, initial=False, active=None):
     while True:
-        title("Telegram 连接方式")
+        title("Telegram 连接与 Bot 控制")
         status_source = active if active is not None else candidate
         for line in telegram_connection_status_lines(status_source):
             print(line)
         if active is not None and _telegram_connection_signature(candidate) != _telegram_connection_signature(active):
             for line in telegram_connection_status_lines(candidate, prefix="待保存"):
                 print(line)
+        print("Bot 控制: {}".format(telegram_control_status(candidate)))
         print("")
         print(" 1) 直连")
         print(" 2) SOCKS5 代理")
@@ -6678,7 +10906,8 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
         print(" 7) 取消并返回")
         print(" 8) 单独检测当前选择（不保存）")
         print(" 9) 测试并保存")
-        choice = prompt_int("请选择", 9, 1, 9)
+        print("10) Bot 控制设置")
+        choice = prompt_int("请选择", 10, 1, 10)
         if choice == 1:
             previous = json.loads(json.dumps(candidate, ensure_ascii=False))
             candidate["connection_mode"] = "direct"
@@ -6749,6 +10978,9 @@ def configure_telegram_connection(candidate, force_ipv4=True, initial=False, act
                 _set_telegram_identity(candidate)
             if yes_no("测试失败，仍保存当前 Telegram 配置", default=False):
                 return candidate, False
+        elif choice == 10:
+            configure_telegram_control(candidate)
+            return candidate, True
 
 
 def configure_telegram(config, initial=False):
@@ -6757,6 +10989,10 @@ def configure_telegram(config, initial=False):
     candidate = json.loads(json.dumps(current, ensure_ascii=False))
     print("Token、代理密码和节点链接只保存在本机 root 可读的配置文件中。")
     _set_telegram_identity(candidate)
+    candidate.setdefault("control_enabled", True)
+    candidate.setdefault("control_admin_ids", [])
+    if initial:
+        print("Telegram Bot 控制默认开启，未单独设置时使用正数私聊 Chat ID 授权。")
     candidate["timeout_seconds"] = prompt_int(
         "Telegram 请求超时（秒）", candidate.get("timeout_seconds", 12), 3, 60
     )
@@ -7184,6 +11420,27 @@ def edit_settings(config):
     config["stop_wait_seconds"] = prompt_int(
         "停止实例后等待确认时间（秒）", config.get("stop_wait_seconds", 45), 0, 600
     )
+    current_watchdog = config.get("watchdog", {})
+    if not isinstance(current_watchdog, dict):
+        current_watchdog = {}
+    config["watchdog"] = {
+        "enabled": yes_no(
+            "启用监控失联告警与自动重启",
+            bool(current_watchdog.get("enabled", True)),
+        ),
+        "timeout_seconds": prompt_int(
+            "心跳失联超时（秒）",
+            current_watchdog.get("timeout_seconds", 600),
+            120,
+            86400,
+        ),
+        "failure_threshold": prompt_int(
+            "连续失败多少次后告警",
+            current_watchdog.get("failure_threshold", 2),
+            1,
+            10,
+        ),
+    }
     save_config(config)
     print("全局设置已保存。服务会在下一轮自动读取新配置。")
 
@@ -7329,7 +11586,8 @@ def update_from_github(confirm_update=True, release_info=None):
         print("最新版本: v{}".format(target_version))
     else:
         print("最新版本: 暂时无法获取（仍可继续更新）")
-    print("更新来源: {}".format(UPDATE_BASE_URL))
+    asset_base_url = update_asset_base_url(target_version)
+    print("更新来源: {}".format(asset_base_url))
     print("现有 config.json、state.json 和日志会保留。")
     confirm_text = "下载并安装 GitHub main 分支最新版本"
     if target_version:
@@ -7338,8 +11596,8 @@ def update_from_github(confirm_update=True, release_info=None):
         print("已取消更新。")
         return None
 
-    installer_url = UPDATE_BASE_URL + "/install.sh"
-    checksum_url = UPDATE_BASE_URL + "/install.sh.sha256"
+    installer_url = asset_base_url + "/install.sh"
+    checksum_url = asset_base_url + "/install.sh.sha256"
     print("正在下载更新和校验文件...")
     try:
         installer = download_update_file(installer_url)
@@ -7356,12 +11614,17 @@ def update_from_github(confirm_update=True, release_info=None):
 
     temporary_path = None
     try:
+        snapshot = backup_manager.create_program_snapshot(APP_DIR, APP_VERSION)
+        print("更新前程序快照: {}".format(snapshot))
         with tempfile.NamedTemporaryFile(prefix="aliyun-guard-update-", suffix=".sh", delete=False) as handle:
             handle.write(installer)
             temporary_path = handle.name
         os.chmod(temporary_path, 0o700)
         print("SHA-256 校验通过: {}".format(actual))
-        result = subprocess.call(["/bin/sh", temporary_path, "--update"])
+        result = subprocess.call(
+            ["/bin/sh", temporary_path, "--update"],
+            stdin=subprocess.DEVNULL,
+        )
     except Exception as exc:
         print("执行更新失败: {}".format(guard.compact_error(exc)))
         return False
@@ -7377,6 +11640,336 @@ def update_from_github(confirm_update=True, release_info=None):
         return False
     print("GitHub 最新版本已安装，后台服务已重启。")
     return True
+
+
+def backup_restore_menu():
+    while True:
+        title("备份、恢复与版本回滚")
+        snapshots = backup_manager.list_program_snapshots(app_dir=APP_DIR)
+        print("程序回滚快照: {} 个".format(len(snapshots)))
+        print(" 1) 创建加密备份")
+        print(" 2) 预览备份差异")
+        print(" 3) 恢复加密备份")
+        print(" 4) 回滚到更新前程序版本")
+        print(" 5) 返回")
+        choice = prompt_int("请输入序号", 1, 1, 5)
+        if choice == 5:
+            return
+        try:
+            if choice == 1:
+                password = prompt_secret("备份密码（至少 8 个字符）")
+                confirmation = prompt_secret("再次输入备份密码")
+                if password != confirmation:
+                    print("两次输入的密码不一致。")
+                    continue
+                path = backup_manager.create_backup(
+                    password,
+                    guard.CONFIG_FILE.parent,
+                    include_state=yes_no("包含状态文件", True),
+                    include_logs=yes_no("包含日志", True),
+                )
+                print("加密备份已创建: {}".format(path))
+            elif choice in (2, 3):
+                path = Path(prompt("备份文件完整路径", required=True)).expanduser()
+                password = prompt_secret("备份密码")
+                preview = backup_manager.preview_restore(
+                    path, password, guard.CONFIG_FILE.parent
+                )
+                summary = preview.get("summary", {})
+                print(
+                    "备份配置: {} 个实例，{} 个节点".format(
+                        summary.get("instances", 0), summary.get("nodes", 0)
+                    )
+                )
+                for item in preview.get("files", []):
+                    print(" - {:<9} {}".format(item["action"], item["path"]))
+                if choice == 3 and yes_no("确认按以上差异恢复", False):
+                    result = backup_manager.restore_backup(
+                        path, password, guard.CONFIG_FILE.parent
+                    )
+                    print("已恢复 {} 个文件。".format(len(result["restored"])))
+                    print("恢复前安全备份: {}".format(result["safety_backup"]))
+                    run_control("restart")
+            elif choice == 4:
+                if not snapshots:
+                    print("当前没有程序回滚快照。")
+                    continue
+                for index, path in enumerate(snapshots, 1):
+                    print(" {:>2}) {}".format(index, path.name))
+                index = prompt_int("选择快照", 1, 1, len(snapshots)) - 1
+                if yes_no("确认恢复程序文件并重启服务", False):
+                    result = backup_manager.restore_program_snapshot(
+                        snapshots[index], APP_DIR
+                    )
+                    print("程序已回滚到快照版本: {}".format(result["version"]))
+                    run_control("restart")
+        except backup_manager.BackupError as exc:
+            print("操作失败: {}".format(exc))
+
+
+def collect_s3_backup_settings(config):
+    current = s3_backup.normalized_config(config.get("s3_backup", {}))
+    title("S3 自动备份设置")
+    candidate = dict(current)
+    candidate["enabled"] = yes_no("启用 S3 自动备份", current["enabled"])
+    candidate["bucket"] = prompt(
+        "Bucket 名称", current["bucket"], required=candidate["enabled"]
+    )
+    candidate["region"] = prompt("AWS/S3 Region", current["region"], required=True)
+    candidate["endpoint_url"] = prompt(
+        "自定义 Endpoint（AWS S3 留空）", current["endpoint_url"]
+    ).rstrip("/")
+    candidate["prefix"] = prompt("对象目录前缀", current["prefix"])
+    styles = [("auto", "自动"), ("path", "路径寻址"), ("virtual", "虚拟主机寻址")]
+    print("\nS3 寻址方式：")
+    default_style = next(
+        (index for index, item in enumerate(styles, 1) if item[0] == current["addressing_style"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(styles, 1):
+        print(" {}) {}".format(index, label))
+    candidate["addressing_style"] = styles[
+        prompt_int("寻址方式", default_style, 1, len(styles)) - 1
+    ][0]
+    use_role = yes_no("使用 EC2 IAM Role/环境凭据", not bool(current["access_key_id"]))
+    if use_role:
+        candidate["access_key_id"] = ""
+        candidate["secret_access_key"] = ""
+        candidate["session_token"] = ""
+    else:
+        candidate["access_key_id"] = prompt_secret(
+            "AWS Access Key ID",
+            keep_existing=not candidate["enabled"] or bool(current["access_key_id"]),
+        ) or current["access_key_id"]
+        candidate["secret_access_key"] = prompt_secret(
+            "AWS Secret Access Key",
+            keep_existing=not candidate["enabled"] or bool(current["secret_access_key"]),
+        ) or current["secret_access_key"]
+        candidate["session_token"] = prompt_secret(
+            "AWS Session Token（长期密钥留空）", keep_existing=True
+        ) or current["session_token"]
+    candidate["backup_password"] = prompt_secret(
+        "自动备份加密密码（至少 8 位）",
+        keep_existing=not candidate["enabled"] or bool(current["backup_password"]),
+    ) or current["backup_password"]
+    schedules = [("hourly", "每小时"), ("daily", "每天"), ("weekly", "每周")]
+    print("\n自动备份周期：")
+    default_schedule = next(
+        (index for index, item in enumerate(schedules, 1) if item[0] == current["schedule"]),
+        2,
+    )
+    for index, (_value, label) in enumerate(schedules, 1):
+        print(" {}) {}".format(index, label))
+    candidate["schedule"] = schedules[
+        prompt_int("周期", default_schedule, 1, len(schedules)) - 1
+    ][0]
+    candidate["time"] = prompt(
+        "执行时间 HH:MM（每小时仅使用分钟）", current["time"], required=True
+    )
+    if candidate["schedule"] == "weekly":
+        candidate["weekday"] = prompt_int(
+            "星期（0=周一，6=周日）", current["weekday"], 0, 6
+        )
+    candidate["retention"] = prompt_int(
+        "云端和本地保留份数", current["retention"], 1, 365
+    )
+    candidate["include_state"] = yes_no("包含运行状态", current["include_state"])
+    candidate["include_logs"] = yes_no("包含日志", current["include_logs"])
+    notifications = [("errors", "仅失败通知"), ("always", "成功和失败都通知"), ("none", "不通知")]
+    print("\nTelegram 通知：")
+    default_notice = next(
+        (index for index, item in enumerate(notifications, 1) if item[0] == current["notification_mode"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(notifications, 1):
+        print(" {}) {}".format(index, label))
+    candidate["notification_mode"] = notifications[
+        prompt_int("通知方式", default_notice, 1, len(notifications)) - 1
+    ][0]
+    encryptions = [("AES256", "SSE-S3"), ("aws:kms", "SSE-KMS"), ("", "关闭服务端加密")]
+    print("\nS3 服务端加密：")
+    default_encryption = next(
+        (index for index, item in enumerate(encryptions, 1) if item[0] == current["server_side_encryption"]),
+        1,
+    )
+    for index, (_value, label) in enumerate(encryptions, 1):
+        print(" {}) {}".format(index, label))
+    candidate["server_side_encryption"] = encryptions[
+        prompt_int("加密方式", default_encryption, 1, len(encryptions)) - 1
+    ][0]
+    if candidate["server_side_encryption"] == "aws:kms":
+        candidate["kms_key_id"] = prompt_secret(
+            "KMS Key ID/ARN", keep_existing=bool(current["kms_key_id"])
+        ) or current["kms_key_id"]
+    else:
+        candidate["kms_key_id"] = ""
+    return s3_backup.validate_config(candidate, require_ready=candidate["enabled"])
+
+
+def print_s3_backups(items):
+    if not items:
+        print("云端没有 Aliyun Guard 加密备份。")
+        return
+    for index, item in enumerate(items, 1):
+        print(
+            " {:>3}) {:<42} {:>8.2f} MiB  {}".format(
+                index,
+                item["name"][:42],
+                float(item["size"]) / 1048576,
+                item.get("modified_at", ""),
+            )
+        )
+
+
+def s3_backup_menu(config):
+    while True:
+        current = s3_backup.normalized_config(config.get("s3_backup", {}))
+        status = s3_backup.read_status(CONFIG_FILE.parent)
+        title("AWS S3 / S3 兼容存储自动备份")
+        print("状态: {}".format("已启用" if current["enabled"] else "已关闭"))
+        print("Bucket: {}".format(current["bucket"] or "未配置"))
+        print("最近成功: {}".format(status.get("last_success_at") or "尚未运行"))
+        if status.get("last_error"):
+            print("最近错误: {}".format(status["last_error"]))
+        print("\n 1) 配置自动备份")
+        print(" 2) 测试当前 S3 连接")
+        print(" 3) 立即创建并上传加密备份")
+        print(" 4) 查看云端备份")
+        print(" 5) 从云端预览并恢复")
+        print(" 6) 返回")
+        choice = prompt_int("请输入序号", 6, 1, 6)
+        if choice == 6:
+            return
+        try:
+            if choice == 1:
+                candidate = collect_s3_backup_settings(config)
+                if candidate["enabled"]:
+                    print("正在测试 S3 连接...")
+                    result = s3_backup.test_connection(candidate)
+                    print("连接成功，延迟约 {} ms。".format(result["latency_ms"]))
+                config["s3_backup"] = candidate
+                save_config(config)
+                print("S3 自动备份设置已保存。")
+            elif choice == 2:
+                result = s3_backup.test_connection(current)
+                print("连接成功：{} / {}，延迟约 {} ms。".format(result["bucket"], result["endpoint"], result["latency_ms"]))
+            elif choice == 3:
+                result = s3_backup.create_and_upload(current, CONFIG_FILE.parent)
+                print("上传成功: s3://{}/{}".format(result["bucket"], result["key"]))
+                print("已清理云端旧备份 {} 份。".format(len(result["deleted"])))
+            elif choice in (4, 5):
+                items = s3_backup.list_backups(current, limit=100)
+                print_s3_backups(items)
+                if choice == 5 and items:
+                    index = prompt_int("选择要恢复的备份", 1, 1, len(items)) - 1
+                    path = s3_backup.download_backup(current, items[index]["key"], CONFIG_FILE.parent)
+                    try:
+                        preview = backup_manager.preview_restore(path, current["backup_password"], CONFIG_FILE.parent)
+                        for item in preview.get("files", []):
+                            print(" - {:<9} {}".format(item["action"], item["path"]))
+                        if yes_no("确认按以上差异恢复并重启服务", False):
+                            result = backup_manager.restore_backup(
+                                path,
+                                current["backup_password"],
+                                CONFIG_FILE.parent,
+                                include_logs=yes_no("恢复备份中的日志", True),
+                            )
+                            print("恢复完成，恢复前安全备份: {}".format(result["safety_backup"]))
+                            run_control("restart")
+                    finally:
+                        path.unlink(missing_ok=True)
+        except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+            print("S3 备份操作失败: {}".format(exc))
+
+
+def discover_instances_menu(config):
+    title("自动发现阿里云 ECS")
+    ak = prompt_secret("AccessKey ID")
+    sk = prompt_secret("AccessKey Secret")
+    regions_text = prompt(
+        "扫描 Region（逗号分隔，留空扫描内置 Region）", ""
+    )
+    regions = [
+        item.strip()
+        for item in regions_text.replace(";", ",").split(",")
+        if item.strip()
+    ]
+    if not regions:
+        print("正在从阿里云账号读取可用 Region...")
+        regions = guard.discover_ecs_regions(ak, sk)
+    tag_key = prompt("标签键筛选（可留空）", "")
+    tag_value = prompt("标签值筛选（可留空）", "") if tag_key else ""
+    if config.get("force_ipv4", True):
+        guard.enable_ipv4_only()
+    result = guard.discover_ecs_instances(ak, sk, regions, tag_key, tag_value)
+    instances = result.get("instances", [])
+    for error in result.get("errors", []):
+        print("[{}] 扫描失败: {}".format(error["region"], error["error"]))
+    if not instances:
+        print("没有发现符合条件的 ECS 实例。")
+        return
+    title("发现 {} 台 ECS".format(len(instances)))
+    for index, item in enumerate(instances, 1):
+        print(
+            "{:>3}) {:<20} {:<18} {:<22} {}".format(
+                index,
+                item["region"],
+                item["status"],
+                item["instance_id"],
+                item["name"],
+            )
+        )
+    selection = prompt("选择序号（逗号分隔，输入 all 全选）", "all")
+    if selection.lower() == "all":
+        indexes = list(range(len(instances)))
+    else:
+        try:
+            indexes = sorted(
+                {
+                    int(value.strip()) - 1
+                    for value in selection.replace(";", ",").split(",")
+                    if value.strip()
+                }
+            )
+        except ValueError:
+            print("选择格式无效。")
+            return
+    selected = [instances[index] for index in indexes if 0 <= index < len(instances)]
+    if not selected:
+        print("没有选择有效实例。")
+        return
+    limit = prompt_float("统一 CDT 关机阈值（GB）", 180, 0.01)
+    actions_enabled = yes_no("允许自动开关机", True)
+    billing = configure_billing({})
+    existing = {
+        (str(item.get("ak")), str(item.get("region")), str(item.get("instance_id")))
+        for item in config.get("users", [])
+    }
+    imported = 0
+    for item in selected:
+        identity = (ak, item["region"], item["instance_id"])
+        if identity in existing:
+            continue
+        config.setdefault("users", []).append(
+            {
+                "name": item["name"] or item["instance_id"],
+                "ak": ak,
+                "sk": sk,
+                "region": item["region"],
+                "instance_id": item["instance_id"],
+                "traffic_limit_gb": limit,
+                "actions_enabled": actions_enabled,
+                "instance_log_enabled": False,
+                "paused": False,
+                "billing": dict(billing),
+                "schedule": dict(guard.DEFAULT_SCHEDULE),
+            }
+        )
+        existing.add(identity)
+        imported += 1
+    if imported:
+        save_config(config)
+    print("已导入 {} 台实例，重复实例已跳过。".format(imported))
 
 
 def show_status(config):
@@ -7450,7 +12043,7 @@ def menu():
         print(" 2) 立即执行一轮检测")
         print(" 3) 演练一轮（不执行开关机）")
         print(" 4) 测试 Telegram 通知")
-        print(" 5) Telegram 连接方式")
+        print(" 5) Telegram 连接与 Bot 控制")
         print(" 6) 查看监控实例")
         print(" 7) 添加监控实例")
         print(" 8) 编辑监控实例")
@@ -7465,8 +12058,11 @@ def menu():
         if update_info and update_info.get("available"):
             update_hint = "  " + yellow_text("[有新版本 v{}]".format(update_info["version"]))
         print("16) 更新 GitHub 版本{}".format(update_hint))
-        print("17) 退出")
-        choice = prompt_int("请输入序号", 1, 1, 17)
+        print("17) 备份、恢复与版本回滚")
+        print("18) 自动发现并批量导入 ECS")
+        print("19) 退出")
+        print("20) AWS S3 自动备份")
+        choice = prompt_int("请输入序号", 19, 1, 20)
         try:
             if choice == 1:
                 show_status(config)
@@ -7503,10 +12099,16 @@ def menu():
                 if update_from_github(release_info=update_info) is True:
                     return 0
             elif choice == 17:
+                backup_restore_menu()
+            elif choice == 18:
+                discover_instances_menu(config)
+            elif choice == 19:
                 return 0
+            elif choice == 20:
+                s3_backup_menu(config)
         except KeyboardInterrupt:
             print("\n操作已取消。")
-        if choice != 17:
+        if choice != 19:
             prompt("按回车返回菜单")
 
 
@@ -7570,6 +12172,41 @@ WEB="$APP_DIR/web_panel.py"
 BACKEND_FILE="$APP_DIR/service_backend"
 SERVICE_NAME="aliyun-guard"
 
+mark_enabled() {
+    rm -f "$APP_DIR/disabled"
+}
+
+mark_disabled() {
+    : > "$APP_DIR/disabled"
+    chmod 600 "$APP_DIR/disabled"
+}
+
+enable_watchdog_cron() {
+    command -v crontab >/dev/null 2>&1 || return 0
+    cron_old=$(mktemp)
+    cron_new=$(mktemp)
+    crontab -l > "$cron_old" 2>/dev/null || :
+    grep -v '# aliyun-guard-watchdog' "$cron_old" > "$cron_new" || :
+    printf '* * * * * %s %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
+        "$PYTHON" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    crontab "$cron_new"
+    rm -f "$cron_old" "$cron_new"
+}
+
+disable_watchdog_cron() {
+    command -v crontab >/dev/null 2>&1 || return 0
+    cron_old=$(mktemp)
+    cron_new=$(mktemp)
+    crontab -l > "$cron_old" 2>/dev/null || :
+    grep -v '# aliyun-guard-watchdog' "$cron_old" > "$cron_new" || :
+    if [ -s "$cron_new" ]; then
+        crontab "$cron_new"
+    else
+        crontab -r >/dev/null 2>&1 || true
+    fi
+    rm -f "$cron_old" "$cron_new"
+}
+
 backend() {
     if [ -r "$BACKEND_FILE" ]; then
         sed -n '1p' "$BACKEND_FILE"
@@ -7592,6 +12229,7 @@ backend_status() {
         systemd)
             systemctl is-enabled "$SERVICE_NAME.service" 2>/dev/null || true
             systemctl is-active "$SERVICE_NAME.service" 2>/dev/null || true
+            systemctl is-active "$SERVICE_NAME-watchdog.timer" 2>/dev/null || true
             ;;
         openrc)
             rc-service "$SERVICE_NAME" status 2>/dev/null || true
@@ -7616,14 +12254,19 @@ start_service() {
     current=$(backend)
     case "$current" in
         systemd)
+            mark_enabled
             systemctl enable --now "$SERVICE_NAME.service"
+            systemctl enable --now "$SERVICE_NAME-watchdog.timer"
             ;;
         openrc)
+            mark_enabled
+            enable_watchdog_cron
             rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
             rc-service "$SERVICE_NAME" start
             ;;
         cron)
-            rm -f "$APP_DIR/disabled"
+            mark_enabled
+            enable_watchdog_cron
             "$PYTHON" "$WEB" ensure >/dev/null 2>&1 || true
             printf '%s\n' "cron 调度已启用。"
             ;;
@@ -7639,14 +12282,19 @@ stop_service() {
     current=$(backend)
     case "$current" in
         systemd)
-            systemctl stop "$SERVICE_NAME.service"
+            mark_disabled
+            systemctl disable --now "$SERVICE_NAME-watchdog.timer" >/dev/null 2>&1 || true
+            systemctl disable --now "$SERVICE_NAME.service"
             ;;
         openrc)
+            mark_disabled
+            disable_watchdog_cron
+            rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
             rc-service "$SERVICE_NAME" stop
             ;;
         cron)
-            : > "$APP_DIR/disabled"
-            chmod 600 "$APP_DIR/disabled"
+            mark_disabled
+            disable_watchdog_cron
             "$PYTHON" "$WEB" stop >/dev/null 2>&1 || true
             printf '%s\n' "cron 调度已暂停。"
             ;;
@@ -7662,14 +12310,19 @@ restart_service() {
     current=$(backend)
     case "$current" in
         systemd)
+            mark_enabled
             systemctl restart "$SERVICE_NAME.service"
+            systemctl enable --now "$SERVICE_NAME-watchdog.timer"
             systemctl is-active "$SERVICE_NAME.service"
             ;;
         openrc)
+            mark_enabled
+            enable_watchdog_cron
             rc-service "$SERVICE_NAME" restart
             ;;
         cron)
-            rm -f "$APP_DIR/disabled"
+            mark_enabled
+            enable_watchdog_cron
             "$PYTHON" "$APP" scheduled
             "$PYTHON" "$WEB" restart
             ;;
@@ -7837,13 +12490,17 @@ fi
 case "$backend" in
     systemd)
         systemctl disable --now "$SERVICE_NAME.service" >/dev/null 2>&1 || true
-        rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+        systemctl disable --now "$SERVICE_NAME-watchdog.timer" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/$SERVICE_NAME.service" \
+            "/etc/systemd/system/$SERVICE_NAME-watchdog.service" \
+            "/etc/systemd/system/$SERVICE_NAME-watchdog.timer"
         systemctl daemon-reload >/dev/null 2>&1 || true
         ;;
     openrc)
         rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
         rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
         rm -f "/etc/init.d/$SERVICE_NAME"
+        rm -f "/etc/periodic/1min/$SERVICE_NAME-watchdog"
         ;;
     cron)
         cron_old=$(mktemp)
@@ -7869,7 +12526,7 @@ rm -rf "$APP_DIR"
 printf '%s\n' "阿里云保活程序已卸载。"
 __AG_UNINSTALL_SH_EOF__
     chmod 700 "$APP_DIR/control.sh" "$APP_DIR/uninstall.sh"
-    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
+    chmod 700 "$APP_DIR/aliyun_guard.py" "$APP_DIR/manager.py" "$APP_DIR/backup_manager.py" "$APP_DIR/s3_backup.py" "$APP_DIR/watchdog.py" "$APP_DIR/telegram_proxy.py" "$APP_DIR/telegram_control.py" "$APP_DIR/web_actions.py" "$APP_DIR/web_panel.py"
     chmod 600 "$APP_DIR/web_panel.html"
     chmod 700 "$APP_DIR"
     chmod 700 "$APP_DIR/logs"
@@ -7878,7 +12535,11 @@ __AG_UNINSTALL_SH_EOF__
     "$VENV_DIR/bin/python" -m py_compile \
         "$APP_DIR/aliyun_guard.py" \
         "$APP_DIR/manager.py" \
+        "$APP_DIR/backup_manager.py" \
+        "$APP_DIR/s3_backup.py" \
+        "$APP_DIR/watchdog.py" \
         "$APP_DIR/telegram_proxy.py" \
+        "$APP_DIR/telegram_control.py" \
         "$APP_DIR/web_actions.py" \
         "$APP_DIR/web_panel.py"
     sh -n "$APP_DIR/control.sh"
@@ -7917,6 +12578,20 @@ remove_cron_entry() {
     rm -f "$cron_old" "$cron_new"
 }
 
+setup_watchdog_cron() {
+    command -v crontab >/dev/null 2>&1 || return 0
+    cron_old=$(mktemp)
+    cron_new=$(mktemp)
+    crontab -l > "$cron_old" 2>/dev/null || :
+    grep -v '# aliyun-guard-watchdog' "$cron_old" > "$cron_new" || :
+    if [ "$START_BACKEND" = yes ]; then
+        printf '* * * * * %s/bin/python %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
+            "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    fi
+    crontab "$cron_new"
+    rm -f "$cron_old" "$cron_new"
+}
+
 setup_systemd() {
     cat > "/etc/systemd/system/$SERVICE_NAME.service" <<EOF
 [Unit]
@@ -7940,7 +12615,37 @@ ProtectHome=true
 [Install]
 WantedBy=multi-user.target
 EOF
+    cat > "/etc/systemd/system/$SERVICE_NAME-watchdog.service" <<EOF
+[Unit]
+Description=Aliyun Guard heartbeat watchdog
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=$APP_DIR
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$VENV_DIR/bin/python $APP_DIR/watchdog.py
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+EOF
+    cat > "/etc/systemd/system/$SERVICE_NAME-watchdog.timer" <<EOF
+[Unit]
+Description=Check Aliyun Guard heartbeat every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=60s
+AccuracySec=10s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
     chmod 644 "/etc/systemd/system/$SERVICE_NAME.service"
+    chmod 644 "/etc/systemd/system/$SERVICE_NAME-watchdog.service" "/etc/systemd/system/$SERVICE_NAME-watchdog.timer"
     if [ -f "/etc/init.d/$SERVICE_NAME" ]; then
         rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
         rm -f "/etc/init.d/$SERVICE_NAME"
@@ -7949,10 +12654,16 @@ EOF
     printf '%s\n' systemd > "$APP_DIR/service_backend"
     systemctl daemon-reload
     if [ "$START_BACKEND" = yes ]; then
+        rm -f "$APP_DIR/disabled"
         systemctl enable --now "$SERVICE_NAME.service"
+        systemctl enable --now "$SERVICE_NAME-watchdog.timer"
     else
+        : > "$APP_DIR/disabled"
+        chmod 600 "$APP_DIR/disabled"
         systemctl disable "$SERVICE_NAME.service" >/dev/null 2>&1 || true
         systemctl stop "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+        systemctl disable "$SERVICE_NAME-watchdog.timer" >/dev/null 2>&1 || true
+        systemctl stop "$SERVICE_NAME-watchdog.timer" >/dev/null 2>&1 || true
     fi
 }
 
@@ -7975,12 +12686,17 @@ depend() {
 EOF
     chmod 755 "/etc/init.d/$SERVICE_NAME"
     rm -f "/etc/systemd/system/$SERVICE_NAME.service"
+    rm -f "/etc/systemd/system/$SERVICE_NAME-watchdog.service" "/etc/systemd/system/$SERVICE_NAME-watchdog.timer"
     remove_cron_entry
     printf '%s\n' openrc > "$APP_DIR/service_backend"
     if [ "$START_BACKEND" = yes ]; then
+        rm -f "$APP_DIR/disabled"
+        setup_watchdog_cron
         rc-update add "$SERVICE_NAME" default >/dev/null 2>&1 || true
         rc-service "$SERVICE_NAME" restart >/dev/null 2>&1 || rc-service "$SERVICE_NAME" start
     else
+        : > "$APP_DIR/disabled"
+        chmod 600 "$APP_DIR/disabled"
         rc-service "$SERVICE_NAME" stop >/dev/null 2>&1 || true
         rc-update del "$SERVICE_NAME" default >/dev/null 2>&1 || true
     fi
@@ -8009,6 +12725,10 @@ setup_cron() {
         "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
     printf '* * * * * %s/bin/python %s/web_panel.py ensure >> %s/logs/web-supervisor.log 2>&1 # aliyun-guard-web\n' \
         "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    if [ "$START_BACKEND" = yes ]; then
+        printf '* * * * * %s/bin/python %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
+            "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    fi
     crontab "$cron_new"
     rm -f "$cron_old" "$cron_new"
     if [ "$START_BACKEND" = yes ]; then

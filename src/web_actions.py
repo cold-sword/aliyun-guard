@@ -3,15 +3,27 @@
 """Management operations exposed by the authenticated web panel."""
 
 import copy
+import base64
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import time
 
 import telegram_proxy
+import backup_manager
+import s3_backup
 
 
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
+DATA_DIR = Path(
+    os.environ.get("ALIYUN_GUARD_CONFIG", APP_DIR / "config.json")
+).parent
+UPDATE_LOG_NAME = "web-update.log"
+UPDATE_STATE_NAME = "web-update-state.json"
+UPDATE_EXIT_MARKER = "__AG_UPDATE_EXIT_CODE="
 
 CONNECTION_LABELS = {
     "direct": "直连",
@@ -157,11 +169,19 @@ def telegram_payload(guard, telegram):
     nodes = guard.telegram_node_urls(telegram)
     active = str(telegram.get("node_url", "") or "").strip()
     mode = str(telegram.get("connection_mode", "direct") or "direct")
+    explicit_admins = guard.normalize_telegram_control_admin_ids(
+        telegram.get("control_admin_ids", [])
+    )
+    effective_admins = guard.telegram_control_admin_ids(telegram)
     return {
         "bot_token_configured": bool(str(telegram.get("bot_token", "")).strip()),
         "chat_id": str(telegram.get("chat_id", "")),
         "timeout_seconds": int(telegram.get("timeout_seconds", 12)),
         "retries": int(telegram.get("retries", 3)),
+        "control_enabled": bool(telegram.get("control_enabled", True)),
+        "control_admin_ids": explicit_admins,
+        "control_effective_admin_ids": effective_admins,
+        "control_uses_chat_id": bool(effective_admins and not explicit_admins),
         "connection_mode": mode,
         "connection_label": CONNECTION_LABELS.get(mode, "未知"),
         "connection_description": guard.telegram_connection_description(telegram),
@@ -196,6 +216,15 @@ def management_payload(guard, backend="unknown"):
             "start_wait_seconds": int(config.get("start_wait_seconds", 90)),
             "stop_wait_seconds": int(config.get("stop_wait_seconds", 45)),
             "start_poll_seconds": int(config.get("start_poll_seconds", 5)),
+            "watchdog": {
+                "enabled": bool(config.get("watchdog", {}).get("enabled", True)),
+                "timeout_seconds": int(
+                    config.get("watchdog", {}).get("timeout_seconds", 600)
+                ),
+                "failure_threshold": int(
+                    config.get("watchdog", {}).get("failure_threshold", 2)
+                ),
+            },
         },
         "web": {
             "enabled": bool(web.get("enabled", False)),
@@ -205,7 +234,403 @@ def management_payload(guard, backend="unknown"):
             "password_configured": bool(str(web.get("password_hash", "")).strip()),
         },
         "backend": backend,
+        "s3_backup": s3_backup_payload(config.get("s3_backup", {})),
+        "rollback_snapshots": [
+            {
+                "name": path.name,
+                "size": path.stat().st_size,
+                "modified_at": int(path.stat().st_mtime),
+            }
+            for path in backup_manager.list_program_snapshots(app_dir=APP_DIR)
+        ],
     }
+
+
+def s3_backup_payload(value):
+    config = s3_backup.normalized_config(value)
+    status = s3_backup.read_status(DATA_DIR)
+    return {
+        "enabled": bool(config.get("enabled", False)),
+        "bucket": config["bucket"],
+        "region": config["region"],
+        "endpoint_url": config["endpoint_url"],
+        "prefix": config["prefix"],
+        "addressing_style": config["addressing_style"],
+        "access_key_configured": bool(config["access_key_id"]),
+        "uses_iam_role": not bool(config["access_key_id"]),
+        "session_token_configured": bool(config["session_token"]),
+        "backup_password_configured": bool(config["backup_password"]),
+        "schedule": config["schedule"],
+        "time": config["time"],
+        "weekday": int(config["weekday"]),
+        "retention": int(config["retention"]),
+        "include_state": bool(config["include_state"]),
+        "include_logs": bool(config["include_logs"]),
+        "notification_mode": config["notification_mode"],
+        "server_side_encryption": config["server_side_encryption"],
+        "kms_key_configured": bool(config["kms_key_id"]),
+        "status": {
+            "last_attempt_at": status.get("last_attempt_at"),
+            "last_success_at": status.get("last_success_at"),
+            "last_key": status.get("last_key"),
+            "last_error": status.get("last_error"),
+        },
+    }
+
+
+def _s3_candidate(guard, data, save=False):
+    if not isinstance(data, dict):
+        raise ManagementError("S3 配置必须是对象")
+    config = guard.load_config()
+    current = s3_backup.normalized_config(config.get("s3_backup", {}))
+    candidate = dict(current)
+    for field in (
+        "bucket",
+        "region",
+        "endpoint_url",
+        "prefix",
+        "schedule",
+        "time",
+        "notification_mode",
+        "server_side_encryption",
+        "addressing_style",
+    ):
+        if field in data:
+            candidate[field] = str(data.get(field, "") or "").strip()
+    for field in ("enabled", "include_state", "include_logs"):
+        if field in data:
+            candidate[field] = _boolean(data, field, candidate[field])
+    candidate["weekday"] = _integer(
+        data, "weekday", candidate["weekday"], 0, 6
+    )
+    candidate["retention"] = _integer(
+        data, "retention", candidate["retention"], 1, 365
+    )
+    use_iam_role = _boolean(
+        data, "use_iam_role", not bool(current["access_key_id"])
+    )
+    if use_iam_role:
+        candidate["access_key_id"] = ""
+        candidate["secret_access_key"] = ""
+        candidate["session_token"] = ""
+    else:
+        for field in ("access_key_id", "secret_access_key", "session_token"):
+            entered = str(data.get(field, "") or "").strip()
+            if entered:
+                candidate[field] = entered
+        if _boolean(data, "clear_session_token", False):
+            candidate["session_token"] = ""
+        if (
+            (candidate["enabled"] or not save)
+            and (not candidate["access_key_id"] or not candidate["secret_access_key"])
+        ):
+            raise ManagementError("未使用 IAM Role 时必须填写 S3 Access Key 和 Secret")
+    entered_password = str(data.get("backup_password", "") or "").strip()
+    if entered_password:
+        candidate["backup_password"] = entered_password
+    entered_kms = str(data.get("kms_key_id", "") or "").strip()
+    if entered_kms:
+        candidate["kms_key_id"] = entered_kms
+    elif candidate.get("server_side_encryption") != "aws:kms":
+        candidate["kms_key_id"] = ""
+    try:
+        candidate = s3_backup.validate_config(
+            candidate, require_ready=bool(candidate.get("enabled")) or not save
+        )
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(str(exc))
+    if save:
+        config["s3_backup"] = candidate
+        _save_config(guard, config)
+    return candidate
+
+
+def save_s3_backup_settings(guard, data):
+    candidate = _s3_candidate(guard, data, save=True)
+    return s3_backup_payload(candidate)
+
+
+def test_s3_backup_settings(guard, data):
+    candidate = _s3_candidate(guard, data, save=False)
+    try:
+        return s3_backup.test_connection(candidate)
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(
+                    candidate["access_key_id"],
+                    candidate["secret_access_key"],
+                    candidate["session_token"],
+                    candidate["backup_password"],
+                ),
+            ),
+            502,
+        )
+
+
+def run_s3_backup_now(guard):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    try:
+        return s3_backup.create_and_upload(
+            backup, DATA_DIR
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(
+                    backup["access_key_id"],
+                    backup["secret_access_key"],
+                    backup["session_token"],
+                    backup["backup_password"],
+                ),
+            ),
+            502,
+        )
+
+
+def list_s3_backups(guard):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    try:
+        return s3_backup.list_backups(backup, limit=100)
+    except s3_backup.S3BackupError as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"]),
+            ),
+            502,
+        )
+
+
+def preview_s3_backup(guard, key):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    path = None
+    try:
+        path = s3_backup.download_backup(backup, key, DATA_DIR)
+        return backup_manager.preview_restore(
+            path, backup["backup_password"], DATA_DIR
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"], backup["backup_password"]),
+            ),
+            502,
+        )
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
+def restore_s3_backup(guard, key, include_logs=True):
+    config = guard.load_config()
+    backup = s3_backup.normalized_config(config.get("s3_backup", {}))
+    path = None
+    try:
+        path = s3_backup.download_backup(backup, key, DATA_DIR)
+        return backup_manager.restore_backup(
+            path,
+            backup["backup_password"],
+            DATA_DIR,
+            include_logs=bool(include_logs),
+        )
+    except (s3_backup.S3BackupError, backup_manager.BackupError) as exc:
+        raise ManagementError(
+            guard.compact_error(
+                exc,
+                secrets=(backup["access_key_id"], backup["secret_access_key"], backup["session_token"], backup["backup_password"]),
+            ),
+            502,
+        )
+    finally:
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+
+def _decode_backup(data):
+    encoded = str(data.get("backup_base64", "") or "").strip()
+    if not encoded:
+        raise ManagementError("请选择备份文件")
+    try:
+        content = base64.b64decode(encoded.encode("ascii"), validate=True)
+    except Exception as exc:
+        raise ManagementError("备份文件编码无效") from exc
+    if len(content) > backup_manager.MAX_BACKUP_FILE_BYTES:
+        raise ManagementError("备份文件过大", 413)
+    return content
+
+
+def _backup_tempfile(content):
+    directory = DATA_DIR / "backups"
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / ".web-upload-{}-{}.agbackup".format(
+        os.getpid(), int(time.time() * 1000)
+    )
+    temporary.write_bytes(content)
+    os.chmod(str(temporary), 0o600)
+    return temporary
+
+
+def create_encrypted_backup(data):
+    password = str(data.get("password", "") or "")
+    include_state = _boolean(data, "include_state", True)
+    include_logs = _boolean(data, "include_logs", True)
+    try:
+        path = backup_manager.create_backup(
+            password,
+            app_dir=DATA_DIR,
+            include_state=include_state,
+            include_logs=include_logs,
+        )
+        content = path.read_bytes()
+        return {
+            "filename": path.name,
+            "backup_base64": base64.b64encode(content).decode("ascii"),
+            "size": len(content),
+        }
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc))
+
+
+def preview_encrypted_backup(data):
+    content = _decode_backup(data)
+    temporary = _backup_tempfile(content)
+    try:
+        return backup_manager.preview_restore(
+            temporary, str(data.get("password", "") or ""), app_dir=DATA_DIR
+        )
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def restore_encrypted_backup(data):
+    content = _decode_backup(data)
+    include_logs = _boolean(data, "include_logs", True)
+    temporary = _backup_tempfile(content)
+    try:
+        return backup_manager.restore_backup(
+            temporary,
+            str(data.get("password", "") or ""),
+            app_dir=DATA_DIR,
+            include_logs=include_logs,
+        )
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc))
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def rollback_program(snapshot_name=None):
+    snapshot = None
+    if snapshot_name:
+        name = Path(str(snapshot_name)).name
+        if name != str(snapshot_name) or not name.startswith("program-"):
+            raise ManagementError("程序快照名称无效")
+        snapshot = APP_DIR / "backups" / name
+    try:
+        return backup_manager.restore_program_snapshot(snapshot, app_dir=APP_DIR)
+    except backup_manager.BackupError as exc:
+        raise ManagementError(str(exc), 409)
+
+
+def discover_instances(guard, data):
+    if not isinstance(data, dict):
+        raise ManagementError("实例发现参数无效")
+    ak = _required_text(data, "ak", label="AccessKey ID")
+    sk = _required_text(data, "sk", label="AccessKey Secret")
+    regions = data.get("regions", [])
+    if isinstance(regions, str):
+        regions = [item.strip() for item in regions.replace(";", ",").split(",") if item.strip()]
+    if not isinstance(regions, list):
+        raise ManagementError("Region 列表格式无效")
+    if not regions:
+        try:
+            regions = guard.discover_ecs_regions(ak, sk)
+        except Exception as exc:
+            raise ManagementError(
+                "自动获取 Region 失败: {}".format(
+                    guard.compact_error(exc, secrets=(ak, sk))
+                ),
+                502,
+            )
+    try:
+        result = guard.discover_ecs_instances(
+            ak,
+            sk,
+            regions,
+            tag_key=str(data.get("tag_key", "") or "").strip(),
+            tag_value=str(data.get("tag_value", "") or "").strip(),
+        )
+    except Exception as exc:
+        raise ManagementError(
+            guard.compact_error(exc, secrets=(ak, sk)), 502
+        )
+    existing = {
+        (str(item.get("ak", "")), str(item.get("region", "")), str(item.get("instance_id", "")))
+        for item in guard.load_config().get("users", [])
+    }
+    for item in result.get("instances", []):
+        item["already_configured"] = (ak, item["region"], item["instance_id"]) in existing
+    return result
+
+
+def import_discovered_instances(guard, data):
+    ak = _required_text(data, "ak", label="AccessKey ID")
+    sk = _required_text(data, "sk", label="AccessKey Secret")
+    selected = data.get("instances", [])
+    if not isinstance(selected, list) or not selected:
+        raise ManagementError("请选择至少一个实例")
+    if len(selected) > 100:
+        raise ManagementError("一次最多导入 100 个实例")
+    limit = _number(data, "traffic_limit_gb", 180, 0.01)
+    actions_enabled = _boolean(data, "actions_enabled", True)
+    billing_site = str(data.get("billing_site", "china") or "china")
+    billing = _copy(BILLING_PRESETS.get(billing_site, BILLING_PRESETS["china"]))
+    config = guard.load_config()
+    users = config.setdefault("users", [])
+    identities = {
+        (str(item.get("ak", "")), str(item.get("region", "")), str(item.get("instance_id", "")))
+        for item in users
+    }
+    imported = []
+    skipped = []
+    for raw in selected:
+        if not isinstance(raw, dict):
+            continue
+        region = str(raw.get("region", "") or "").strip()
+        instance_id = str(raw.get("instance_id", "") or "").strip()
+        identity = (ak, region, instance_id)
+        if not region or not instance_id or identity in identities:
+            skipped.append(instance_id or "无效实例")
+            continue
+        user = {
+            "name": str(raw.get("name", "") or instance_id).strip()[:80],
+            "ak": ak,
+            "sk": sk,
+            "region": region,
+            "instance_id": instance_id,
+            "traffic_limit_gb": limit,
+            "actions_enabled": actions_enabled,
+            "instance_log_enabled": False,
+            "paused": False,
+            "billing": _copy(billing),
+            "schedule": _copy(guard.DEFAULT_SCHEDULE),
+        }
+        users.append(user)
+        identities.add(identity)
+        imported.append(instance_id)
+    if not imported:
+        raise ManagementError("所选实例均已存在或数据无效", 409)
+    _save_config(guard, config)
+    return {"imported": imported, "skipped": skipped, "count": len(imported)}
 
 
 def _normalize_billing(guard, raw, existing):
@@ -419,6 +844,33 @@ def update_global_settings(guard, data):
     config["start_poll_seconds"] = _integer(
         data, "start_poll_seconds", config.get("start_poll_seconds", 5), 1, 60
     )
+    watchdog_data = data.get("watchdog", {})
+    if not isinstance(watchdog_data, dict):
+        raise ManagementError("watchdog 必须是对象")
+    current_watchdog = config.get("watchdog", {})
+    if not isinstance(current_watchdog, dict):
+        current_watchdog = {}
+    config["watchdog"] = {
+        "enabled": _boolean(
+            watchdog_data,
+            "enabled",
+            bool(current_watchdog.get("enabled", True)),
+        ),
+        "timeout_seconds": _integer(
+            watchdog_data,
+            "timeout_seconds",
+            current_watchdog.get("timeout_seconds", 600),
+            120,
+            86400,
+        ),
+        "failure_threshold": _integer(
+            watchdog_data,
+            "failure_threshold",
+            current_watchdog.get("failure_threshold", 2),
+            1,
+            10,
+        ),
+    }
     _save_config(guard, config)
     return management_payload(guard)["settings"]
 
@@ -505,6 +957,18 @@ def update_telegram_identity(guard, data):
     telegram["retries"] = _integer(
         data, "retries", telegram.get("retries", 3), 1, 5
     )
+    telegram["control_enabled"] = _boolean(
+        data,
+        "control_enabled",
+        bool(telegram.get("control_enabled", True)),
+    )
+    if "control_admin_ids" in data:
+        try:
+            telegram["control_admin_ids"] = guard.normalize_telegram_control_admin_ids(
+                data.get("control_admin_ids")
+            )
+        except Exception as exc:
+            raise ManagementError(str(exc))
     _save_config(guard, config)
     return telegram_payload(guard, telegram)
 
@@ -677,6 +1141,140 @@ def check_update():
     }
 
 
+def _update_paths():
+    log_dir = APP_DIR / "logs"
+    return log_dir / UPDATE_LOG_NAME, log_dir / UPDATE_STATE_NAME
+
+
+def _write_update_state(data):
+    _log_path, state_path = _update_paths()
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = state_path.with_name(state_path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(data, ensure_ascii=False, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    os.chmod(temporary, 0o600)
+    os.replace(str(temporary), str(state_path))
+
+
+def _read_update_state():
+    _log_path, state_path = _update_paths()
+    try:
+        data = json.loads(state_path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _prepare_update_tracking(target_version=None, backend=""):
+    log_path, _state_path = _update_paths()
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.write_text("网页更新任务已启动。\n", encoding="utf-8")
+    os.chmod(log_path, 0o600)
+    version = str(target_version or "").strip()
+    if len(version) > 32 or any(
+        character not in "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-+"
+        for character in version
+    ):
+        version = ""
+    state = {
+        "status": "running",
+        "started_at": int(time.time()),
+        "target_version": version or None,
+        "backend": str(backend or ""),
+        "job": None,
+    }
+    _write_update_state(state)
+    return state
+
+
+def _update_log_text(limit=262144):
+    log_path, _state_path = _update_paths()
+    try:
+        with log_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - int(limit)), os.SEEK_SET)
+            return handle.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def update_progress():
+    state = _read_update_state()
+    text = _update_log_text()
+    if not state and not text:
+        return {
+            "status": "idle",
+            "progress": 0,
+            "message": "尚未启动更新",
+            "target_version": None,
+        }
+
+    stages = [
+        ("网页更新任务已启动", 3, "正在启动更新任务"),
+        ("正在下载更新和校验文件", 12, "正在下载正式版文件"),
+        ("SHA-256 校验通过", 25, "文件校验通过"),
+        ("[1/6]", 35, "正在检查系统依赖"),
+        ("[2/6]", 48, "正在更新 Python 环境"),
+        ("[3/6]", 62, "正在写入程序文件"),
+        ("[4/6]", 74, "正在恢复本机配置"),
+        ("[5/6]", 86, "正在重启后台服务"),
+        ("[6/6]", 95, "正在验证更新结果"),
+        ("安装完成。", 98, "程序文件已安装"),
+    ]
+    progress = 0
+    message = "等待更新进程输出"
+    for marker, value, label in stages:
+        if marker in text and value >= progress:
+            progress = value
+            message = label
+
+    exit_code = None
+    if UPDATE_EXIT_MARKER in text:
+        tail = text.rsplit(UPDATE_EXIT_MARKER, 1)[-1].splitlines()[0].strip()
+        try:
+            exit_code = int(tail)
+        except ValueError:
+            exit_code = None
+    success = "GitHub 最新版本已安装，后台服务已重启" in text or exit_code == 0
+    started_at = int(state.get("started_at", 0) or 0)
+    timed_out = bool(started_at and time.time() - started_at > 3600)
+    failure = (
+        state.get("status") == "error"
+        or timed_out
+        or exit_code not in (None, 0)
+        or any(
+            marker in text
+            for marker in (
+                "更新下载失败:",
+                "执行更新失败:",
+                "更新安装器退出码:",
+                "错误:",
+            )
+        )
+    )
+    if success:
+        status = "success"
+        progress = 100
+        message = "更新完成，后台服务已重新加载"
+    elif failure:
+        status = "error"
+        message = "更新失败，请查看 web-update.log"
+    else:
+        status = "running"
+
+    return {
+        "status": status,
+        "progress": max(0, min(100, int(progress))),
+        "message": message,
+        "target_version": state.get("target_version"),
+        "started_at": state.get("started_at"),
+        "job": state.get("job"),
+    }
+
+
 def detached_process(command, log_name):
     log_path = APP_DIR / "logs" / log_name
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -695,6 +1293,60 @@ def detached_process(command, log_name):
     finally:
         log_handle.close()
     return process.pid
+
+
+def _update_wrapper_command(command, log_path):
+    shell_command = (
+        'log_path=$1; shift; "$@" >>"$log_path" 2>&1; '
+        'rc=$?; printf "\\n{}%s\\n" "$rc" >>"$log_path"; exit "$rc"'
+    ).format(UPDATE_EXIT_MARKER)
+    return [
+        "/bin/sh",
+        "-c",
+        shell_command,
+        "aliyun-guard-update",
+        str(log_path),
+        *command,
+    ]
+
+
+def systemd_update_process(command, log_name):
+    systemd_run = shutil.which("systemd-run")
+    if not systemd_run:
+        raise ManagementError(
+            "当前 systemd 环境缺少 systemd-run，无法从网页安全更新；"
+            "请通过 SSH 执行 aliyun-guard update",
+            500,
+        )
+    log_path = APP_DIR / "logs" / log_name
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_path.touch(mode=0o600, exist_ok=True)
+    os.chmod(log_path, 0o600)
+    unit = "aliyun-guard-update-{}-{}".format(os.getpid(), int(time.time() * 1000))
+    launcher = [
+        systemd_run,
+        "--quiet",
+        "--no-block",
+        "--property=StandardInput=null",
+        "--unit={}".format(unit),
+        *_update_wrapper_command(command, log_path),
+    ]
+    try:
+        result = subprocess.run(
+            launcher,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        raise ManagementError("启动独立更新服务失败: {}".format(exc), 500)
+    if result.returncode != 0:
+        detail = str(result.stdout or "systemd-run 返回错误").strip()
+        raise ManagementError("启动独立更新服务失败: {}".format(detail), 500)
+    return unit
 
 
 def service_command(action):
@@ -717,7 +1369,7 @@ def service_command(action):
         raise ManagementError("服务重启失败: {}".format(exc), 500)
 
 
-def install_update():
+def install_update(target_version=None):
     if os.environ.get("ALIYUN_GUARD_CONTAINER") == "1":
         raise ManagementError(
             "Docker 部署请在宿主机执行 git pull && docker compose up -d --build",
@@ -726,10 +1378,33 @@ def install_update():
     manager_path = APP_DIR / "manager.py"
     if not manager_path.exists():
         raise ManagementError("更新程序不存在", 500)
+    if update_progress().get("status") == "running":
+        raise ManagementError("已有更新任务正在运行，请等待当前任务完成", 409)
+    command = [sys.executable, "-u", str(manager_path), "update", "--yes"]
+    backend_path = APP_DIR / "service_backend"
     try:
-        return detached_process(
-            [sys.executable, str(manager_path), "update", "--yes"],
-            "web-update.log",
-        )
+        backend = backend_path.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        backend = ""
+    state = _prepare_update_tracking(target_version=target_version, backend=backend)
+    try:
+        if backend == "systemd":
+            job = systemd_update_process(command, UPDATE_LOG_NAME)
+        else:
+            log_path, _state_path = _update_paths()
+            job = detached_process(
+                _update_wrapper_command(command, log_path), UPDATE_LOG_NAME
+            )
+        state["job"] = str(job)
+        _write_update_state(state)
+        return job
+    except ManagementError as exc:
+        state["status"] = "error"
+        state["message"] = str(exc)
+        _write_update_state(state)
+        raise
     except Exception as exc:
+        state["status"] = "error"
+        state["message"] = str(exc)
+        _write_update_state(state)
         raise ManagementError("启动更新失败: {}".format(exc), 500)
