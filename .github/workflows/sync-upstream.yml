@@ -50,7 +50,26 @@ jobs:
         if: steps.check.outputs.behind != '0'
         run: |
           git checkout -B sync/upstream-main origin/main
-          git merge upstream/main --no-edit
+
+          if ! git merge upstream/main --no-edit; then
+            conflicts=$(git diff --name-only --diff-filter=U)
+            echo "Merge conflicts detected:"
+            echo "$conflicts"
+
+            # The fork intentionally uses prebuilt GHCR/Docker Hub images for docker-compose.yml,
+            # while upstream keeps a local build-oriented compose file. Preserve the fork variant
+            # when this is the only conflict, then finish the merge automatically.
+            if [ "$conflicts" = "docker-compose.yml" ]; then
+              echo "Resolving docker-compose.yml by preserving the fork deployment config."
+              git checkout --ours docker-compose.yml
+              git add docker-compose.yml
+              git commit --no-edit
+            else
+              echo "Unsupported merge conflicts. Please resolve manually."
+              exit 1
+            fi
+          fi
+
           git push origin sync/upstream-main --force-with-lease
           git push origin --tags
 
