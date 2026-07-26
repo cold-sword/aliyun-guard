@@ -322,6 +322,10 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertFalse(data["secure_cookie"])
 
+    def test_server_limits_worker_threads_and_sets_socket_timeout(self):
+        self.assertEqual(self.server.request_queue_size, 64)
+        self.assertEqual(self.server.request_slots._value, web_panel.MAX_REQUEST_THREADS)
+
     def test_update_progress_is_available_during_service_restart(self):
         progress_dir = Path(self.temp.name) / "app"
         with mock.patch.object(web_panel.web_actions, "APP_DIR", progress_dir):
@@ -764,6 +768,25 @@ class ManualControlTests(unittest.TestCase):
 
 
 class WebHtmlTests(unittest.TestCase):
+    def test_telegram_forms_keep_existing_ids_inside_collapsible_panels(self):
+        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
+        telegram = html.split('<section id="telegramTab"', 1)[1].split(
+            '<section id="logsTab"', 1
+        )[0]
+        self.assertEqual(telegram.count("<details"), 3)
+        self.assertEqual(telegram.count("</details>"), 3)
+        self.assertIn('<details class="panel collapsible-panel" open>', telegram)
+        self.assertIn('title="展开或收起机器人配置"', telegram)
+        self.assertIn('title="展开或收起 Telegram 连接设置"', telegram)
+        self.assertIn('title="展开或收起节点管理"', telegram)
+        self.assertIn('<form id="telegramIdentityForm">', telegram)
+        self.assertIn('<form id="connectionForm">', telegram)
+        self.assertIn('<form id="nodeAddForm" class="panel-body">', telegram)
+        self.assertIn('id="nodeList"', telegram)
+        self.assertIn('节点链接或订阅地址', telegram)
+        self.assertIn('anytls://', telegram)
+        self.assertIn('result.source === "subscription"', html)
+
     def test_settings_forms_keep_existing_ids_inside_collapsible_panels(self):
         html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
         self.assertIn('<details class="panel collapsible-panel" open>', html)
@@ -772,6 +795,36 @@ class WebHtmlTests(unittest.TestCase):
         self.assertIn('<form id="settingsForm">', html)
         self.assertIn('<form id="webSettingsForm">', html)
         self.assertIn(".collapsible-panel > summary", html)
+
+    def test_system_controls_keep_existing_ids_inside_collapsible_panels(self):
+        html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
+        system = html.split('<section id="systemTab"', 1)[1].split("</main>", 1)[0]
+        self.assertEqual(system.count("<details"), 6)
+        self.assertEqual(system.count("</details>"), 6)
+        self.assertEqual(system.count('class="panel collapsible-panel" open'), 1)
+        for title in (
+            "展开或收起运行环境",
+            "展开或收起 GitHub 更新",
+            "展开或收起加密备份",
+            "展开或收起恢复备份",
+            "展开或收起 AWS S3 自动备份",
+            "展开或收起程序版本回滚",
+        ):
+            self.assertIn(f'title="{title}"', system)
+        for form_id in ("backupCreateForm", "backupRestoreForm", "s3BackupForm"):
+            self.assertIn(f'<form id="{form_id}">', system)
+        for button_id in (
+            "restartServiceButton",
+            "checkUpdateButton",
+            "installUpdateButton",
+            "previewRestoreButton",
+            "restoreBackupButton",
+            "s3TestButton",
+            "s3RunButton",
+            "s3ListButton",
+            "rollbackButton",
+        ):
+            self.assertIn(f'id="{button_id}"', system)
 
     def test_update_panel_has_real_progress_and_reconnect_polling(self):
         html = (ROOT / "src" / "web_panel.html").read_text(encoding="utf-8")
