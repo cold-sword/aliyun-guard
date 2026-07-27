@@ -163,6 +163,15 @@ class NodeParserTests(unittest.TestCase):
             telegram_proxy.parse_subscription_content(encoded_subscription), [vless, anytls]
         )
 
+    def test_parses_subscription_with_more_than_former_node_limit(self):
+        nodes = [
+            "anytls://password@node{}.example:443#Node{}".format(index, index)
+            for index in range(301)
+        ]
+        self.assertEqual(
+            telegram_proxy.parse_subscription_content("\n".join(nodes)), nodes
+        )
+
     def test_rejects_private_subscription_address(self):
         with mock.patch.object(
             telegram_proxy.socket,
@@ -171,6 +180,18 @@ class NodeParserTests(unittest.TestCase):
         ):
             with self.assertRaises(telegram_proxy.ProxyError):
                 telegram_proxy._subscription_url("https://subscription.example/list")
+
+    def test_dns_encoding_failure_is_a_subscription_error(self):
+        with mock.patch.object(
+            telegram_proxy.socket,
+            "getaddrinfo",
+            side_effect=UnicodeError("invalid host"),
+        ):
+            with self.assertRaises(telegram_proxy.ProxyError) as raised:
+                telegram_proxy._subscription_url(
+                    "https://subscription.example/list"
+                )
+        self.assertIn("无法解析", str(raised.exception))
 
     def test_malformed_node_link_is_a_proxy_error_and_subscription_skips_it(self):
         malformed = "anytls://password@[broken:443"
