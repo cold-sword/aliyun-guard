@@ -246,6 +246,10 @@ handle_legacy_monitor() {
 }
 
 install_packages() {
+    if [ "$INSTALL_ACTION" = update ] && [ -x "$VENV_DIR/bin/python" ]; then
+        say "${GREEN}更新模式：复用现有 Python 环境，跳过系统依赖安装。${RESET}"
+        return
+    fi
     say "${YELLOW}[1/6] 安装系统依赖...${RESET}"
     case "$PKG_MANAGER" in
         apt)
@@ -292,6 +296,10 @@ find_python() {
 
 create_venv() {
     say "${YELLOW}[2/6] 创建 Python 独立环境...${RESET}"
+    if [ "$INSTALL_ACTION" = update ] && [ -x "$VENV_DIR/bin/python" ]; then
+        say "${GREEN}更新模式：复用现有虚拟环境。${RESET}"
+        return
+    fi
     if [ ! -x "$VENV_DIR/bin/python" ]; then
         rm -rf "$VENV_DIR"
         if ! "$PYTHON" -m venv "$VENV_DIR" 2>/dev/null; then
@@ -408,6 +416,9 @@ Type=simple
 User=root
 WorkingDirectory=$APP_DIR
 Environment=PYTHONUNBUFFERED=1
+Environment=ALIYUN_GUARD_HOME=$APP_DIR
+Environment=ALIYUN_GUARD_CONFIG=$APP_DIR/config.json
+Environment=ALIYUN_GUARD_STATE=$APP_DIR/state.json
 ExecStart=$VENV_DIR/bin/python $APP_DIR/aliyun_guard.py daemon
 Restart=always
 RestartSec=10
@@ -429,6 +440,9 @@ Type=oneshot
 User=root
 WorkingDirectory=$APP_DIR
 Environment=PYTHONUNBUFFERED=1
+Environment=ALIYUN_GUARD_HOME=$APP_DIR
+Environment=ALIYUN_GUARD_CONFIG=$APP_DIR/config.json
+Environment=ALIYUN_GUARD_STATE=$APP_DIR/state.json
 ExecStart=$VENV_DIR/bin/python $APP_DIR/watchdog.py
 UMask=0077
 NoNewPrivileges=true
@@ -482,6 +496,9 @@ command_background="yes"
 pidfile="/run/$SERVICE_NAME.pid"
 output_log="$APP_DIR/logs/service.log"
 error_log="$APP_DIR/logs/service.log"
+export ALIYUN_GUARD_HOME="$APP_DIR"
+export ALIYUN_GUARD_CONFIG="$APP_DIR/config.json"
+export ALIYUN_GUARD_STATE="$APP_DIR/state.json"
 
 depend() {
     need net
@@ -525,13 +542,13 @@ setup_cron() {
     cron_new=$(mktemp)
     crontab -l > "$cron_old" 2>/dev/null || :
     grep -v '# aliyun-guard' "$cron_old" > "$cron_new" || :
-    printf '* * * * * %s/bin/python %s/aliyun_guard.py scheduled >> %s/logs/cron.log 2>&1 # aliyun-guard\n' \
-        "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
-    printf '* * * * * %s/bin/python %s/web_panel.py ensure >> %s/logs/web-supervisor.log 2>&1 # aliyun-guard-web\n' \
-        "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    printf '* * * * * ALIYUN_GUARD_HOME=%s ALIYUN_GUARD_CONFIG=%s/config.json ALIYUN_GUARD_STATE=%s/state.json %s/bin/python %s/aliyun_guard.py scheduled >> %s/logs/cron.log 2>&1 # aliyun-guard\n' \
+        "$APP_DIR" "$APP_DIR" "$APP_DIR" "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+    printf '* * * * * ALIYUN_GUARD_HOME=%s ALIYUN_GUARD_CONFIG=%s/config.json ALIYUN_GUARD_STATE=%s/state.json %s/bin/python %s/web_panel.py ensure >> %s/logs/web-supervisor.log 2>&1 # aliyun-guard-web\n' \
+        "$APP_DIR" "$APP_DIR" "$APP_DIR" "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
     if [ "$START_BACKEND" = yes ]; then
-        printf '* * * * * %s/bin/python %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
-            "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
+        printf '* * * * * ALIYUN_GUARD_HOME=%s ALIYUN_GUARD_CONFIG=%s/config.json ALIYUN_GUARD_STATE=%s/state.json %s/bin/python %s/watchdog.py >> %s/logs/watchdog.log 2>&1 # aliyun-guard-watchdog\n' \
+            "$APP_DIR" "$APP_DIR" "$APP_DIR" "$VENV_DIR" "$APP_DIR" "$APP_DIR" >> "$cron_new"
     fi
     crontab "$cron_new"
     rm -f "$cron_old" "$cron_new"

@@ -135,6 +135,13 @@ _INSTANCE_LOG_LOCK = threading.Lock()
 MAX_ECS_STATUS_BATCH_CALLS = 32
 _TELEGRAM_LOCAL = threading.local()
 
+# 阿里云 SDK 对可重试的 HTTP 错误可能进行额外重试。检测服务是周期任务，
+# 请求失败时应尽快结束本轮并保留下一轮重试机会，不能让一次网络故障阻塞数十分钟。
+ALIYUN_API_CONNECT_TIMEOUT_SECONDS = 5
+ALIYUN_API_READ_TIMEOUT_SECONDS = 15
+CDT_REQUEST_ATTEMPTS = 3
+CDT_RETRY_BACKOFF_SECONDS = (1, 2)
+
 
 class GuardError(RuntimeError):
     pass
@@ -307,6 +314,20 @@ def load_state():
         return {}
 
 
+def fsync_directory(path):
+    """Make a replaced directory entry durable across a host reboot."""
+    if os.name == "nt":  # pragma: no cover - deployed targets are Linux
+        return
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    descriptor = os.open(str(Path(path)), flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def atomic_write_json(path, value, mode=0o600, durable=True):
     path = Path(path)
     with _JSON_WRITE_LOCK:
@@ -324,6 +345,8 @@ def atomic_write_json(path, value, mode=0o600, durable=True):
                     os.fsync(handle.fileno())
             os.chmod(str(temporary), mode)
             os.replace(str(temporary), str(path))
+            if durable:
+                fsync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
 
@@ -569,12 +592,60 @@ def enable_ipv4_only():
         pass
 
 
+def _redact_request_details(text):
+    """Remove signed API request details from errors shown in logs/notifications."""
+    def redact_url(match):
+        value = match.group(0)
+        try:
+            parsed = urllib.parse.urlsplit(value)
+            path = parsed.path or "/"
+            suffix = "?[请求参数已隐藏]" if parsed.query else ""
+            return urllib.parse.urlunsplit(
+                (parsed.scheme, parsed.netloc, path, "", "")
+            ) + suffix
+        except ValueError:
+            return "[请求地址已隐藏]"
+
+    text = re.sub(r"https?://[^\s<>\"']+", redact_url, text, flags=re.IGNORECASE)
+
+    # urllib3 会把签名后的 query string 放在 `with url:` 后面，而不是完整 URL。
+    text = re.sub(
+        r"(with url:\s+)(/[^\s)]*)",
+        lambda match: match.group(1)
+        + ("/[请求参数已隐藏]" if "?" in match.group(2) else match.group(2)),
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # SSLEOFError 的原始 repr 很长，且通常伴随已签名 URL；保留服务端点和可操作结论即可。
+    if "SSLEOFError" in text or "UNEXPECTED_EOF_WHILE_READING" in text:
+        endpoint = re.search(
+            r"(?:host=|HTTPSConnectionPool\(host=)[\'\"]?([^,\'\")]+)[\'\"]?,\s*port=(\d+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        target = "{}:{}".format(endpoint.group(1), endpoint.group(2)) if endpoint else "阿里云 API"
+        return "{}：TLS/SSL 连接被对端提前关闭（可能与出口网络、代理或 IPv4/IPv6 路径有关）".format(target)
+
+    # 其他连接池错误也不需要把完整签名请求复制到 Telegram。
+    if "Max retries exceeded" in text and "ConnectionPool" in text:
+        endpoint = re.search(
+            r"(?:host=|ConnectionPool\(host=)[\'\"]?([^,\'\")]+)[\'\"]?,\s*port=(\d+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        target = "{}:{}".format(endpoint.group(1), endpoint.group(2)) if endpoint else "远程 API"
+        return "{}：网络请求重试次数已耗尽".format(target)
+    return text
+
+
 def compact_error(exc, limit=500, secrets=None):
     text = " ".join(str(exc).replace("\r", " ").replace("\n", " ").split())
     for secret in secrets or []:
         secret = str(secret or "")
         if secret:
             text = text.replace(secret, "***")
+    text = _redact_request_details(text)
     return text[:limit] if text else exc.__class__.__name__
 
 
@@ -725,13 +796,88 @@ def require_sdk():
         raise GuardError("阿里云 SDK 未安装: {}".format(SDK_IMPORT_ERROR))
 
 
+def configure_aliyun_request(
+    request,
+    connect_timeout_seconds=ALIYUN_API_CONNECT_TIMEOUT_SECONDS,
+    read_timeout_seconds=ALIYUN_API_READ_TIMEOUT_SECONDS,
+):
+    """Apply bounded network settings to an individual API request."""
+    request.set_connect_timeout(int(connect_timeout_seconds))
+    request.set_read_timeout(int(read_timeout_seconds))
+    return request
+
+
+def format_duration(seconds):
+    """Render long cycle durations in a form that is easy to scan."""
+    try:
+        seconds = max(0.0, float(seconds))
+    except (TypeError, ValueError):
+        return "未知"
+    if seconds < 60:
+        return "{:.1f} 秒".format(seconds)
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return "{} 分 {:.1f} 秒".format(int(minutes), remainder)
+    hours, minutes = divmod(int(minutes), 60)
+    return "{} 小时 {} 分 {:.1f} 秒".format(hours, minutes, remainder)
+
+
 def make_client(user, region=None):
     require_sdk()
     return AcsClient(
         str(user["ak"]).strip(),
         str(user["sk"]).strip(),
         region or str(user["region"]).strip(),
+        # CommonRequest 转换后不会把其超时字段完整传递到底层请求；
+        # 在客户端层同时设置超时，并关闭 SDK 的隐式重试，确保单轮有界。
+        auto_retry=False,
+        connect_timeout=ALIYUN_API_CONNECT_TIMEOUT_SECONDS,
+        timeout=ALIYUN_API_READ_TIMEOUT_SECONDS,
     )
+
+
+def is_retryable_aliyun_network_error(exc):
+    """Identify transport failures that are likely to succeed on a fresh request."""
+    pending = [exc]
+    seen = set()
+    markers = (
+        "connection aborted",
+        "connection reset",
+        "connection reset by peer",
+        "connection refused",
+        "connection broken",
+        "remote end closed connection",
+        "unexpected_eof_while_reading",
+        "ssleoferror",
+        "read timed out",
+        "connect timeout",
+        "connection timed out",
+        "timed out",
+    )
+    while pending:
+        current = pending.pop(0)
+        if not isinstance(current, BaseException) or id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (ConnectionError, TimeoutError, socket.timeout)):
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in markers):
+            return True
+        pending.extend(
+            nested
+            for nested in (
+                getattr(current, "__cause__", None),
+                getattr(current, "__context__", None),
+            )
+            if isinstance(nested, BaseException)
+        )
+        pending.extend(
+            nested
+            for nested in getattr(current, "args", ())
+            if isinstance(nested, BaseException)
+        )
+    return False
 
 
 def get_billing_config(user):
@@ -867,8 +1013,7 @@ def query_instance_bill(user):
     request.set_domain(str(billing["endpoint"]).strip())
     request.set_version("2017-12-14")
     request.set_action_name("DescribeInstanceBill")
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     request.add_query_param("BillingCycle", dt.datetime.now().strftime("%Y-%m"))
     request.add_query_param("InstanceID", str(user["instance_id"]).strip())
     request.add_query_param("ProductCode", "ecs")
@@ -992,16 +1137,33 @@ def query_instance_bill_cached(
 
 def query_cdt_traffic_gb(user):
     require_sdk()
-    request = CommonRequest()
-    request.set_protocol_type("https")
-    request.set_accept_format("json")
-    request.set_method("POST")
-    request.set_domain("cdt.aliyuncs.com")
-    request.set_version("2021-08-13")
-    request.set_action_name("ListCdtInternetTraffic")
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
-    response = make_client(user, "cn-hangzhou").do_action_with_exception(request)
+    response = None
+    for attempt in range(1, CDT_REQUEST_ATTEMPTS + 1):
+        request = CommonRequest()
+        request.set_protocol_type("https")
+        request.set_accept_format("json")
+        request.set_method("POST")
+        request.set_domain("cdt.aliyuncs.com")
+        request.set_version("2021-08-13")
+        request.set_action_name("ListCdtInternetTraffic")
+        configure_aliyun_request(request)
+        try:
+            response = make_client(
+                user, "cn-hangzhou"
+            ).do_action_with_exception(request)
+            break
+        except Exception as exc:
+            if attempt >= CDT_REQUEST_ATTEMPTS or not is_retryable_aliyun_network_error(exc):
+                raise
+            delay = CDT_RETRY_BACKOFF_SECONDS[attempt - 1]
+            LOGGER.warning(
+                "[CDT] 流量查询网络失败，将在 %s 秒后重试（第 %s/%s 次）: %s",
+                delay,
+                attempt + 1,
+                CDT_REQUEST_ATTEMPTS,
+                compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
+            )
+            time.sleep(delay)
     data = json.loads(response.decode("utf-8"))
     details = data.get("TrafficDetails", [])
     total_bytes = sum(float(item.get("Traffic", 0) or 0) for item in details)
@@ -1041,8 +1203,7 @@ def query_instance_status(user):
     request.set_protocol_type("https")
     request.set_accept_format("json")
     request.set_InstanceIds(json.dumps([str(user["instance_id"]).strip()]))
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     response = make_client(user).do_action_with_exception(request)
     data = json.loads(response.decode("utf-8"))
     instances = data.get("Instances", {}).get("Instance", [])
@@ -1079,8 +1240,7 @@ def query_instance_statuses(users):
         json.dumps([str(user.get("instance_id", "") or "").strip() for user in users])
     )
     request.set_PageSize(min(100, len(users)))
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     response = make_client(users[0]).do_action_with_exception(request)
     data = json.loads(response.decode("utf-8"))
     instances = data.get("Instances", {}).get("Instance", [])
@@ -1179,8 +1339,7 @@ def discover_ecs_regions(ak, sk):
     request.set_domain("ecs.aliyuncs.com")
     request.set_version("2014-05-26")
     request.set_action_name("DescribeRegions")
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     credentials = {"ak": access_key, "sk": secret_key}
     response = make_client(credentials, "cn-hangzhou").do_action_with_exception(request)
     data = json.loads(response.decode("utf-8"))
@@ -1226,8 +1385,7 @@ def discover_ecs_instances(ak, sk, regions, tag_key="", tag_value=""):
                 request.set_accept_format("json")
                 request.set_PageNumber(page)
                 request.set_PageSize(100)
-                request.set_connect_timeout(5000)
-                request.set_read_timeout(20000)
+                configure_aliyun_request(request, read_timeout_seconds=20)
                 response = make_client(credentials, region).do_action_with_exception(request)
                 data = json.loads(response.decode("utf-8"))
                 instances = data.get("Instances", {}).get("Instance", [])
@@ -1280,8 +1438,7 @@ def start_instance(user):
     request.set_protocol_type("https")
     request.set_accept_format("json")
     request.set_InstanceId(str(user["instance_id"]).strip())
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     make_client(user).do_action_with_exception(request)
 
 
@@ -1291,8 +1448,7 @@ def stop_instance(user):
     request.set_protocol_type("https")
     request.set_accept_format("json")
     request.set_InstanceId(str(user["instance_id"]).strip())
-    request.set_connect_timeout(5000)
-    request.set_read_timeout(15000)
+    configure_aliyun_request(request)
     make_client(user).do_action_with_exception(request)
 
 
@@ -2108,7 +2264,7 @@ def build_summary(results, started_at, duration, dry_run=False):
                 )
             )
         if item["traffic_gb"] is None:
-            lines.append("  流量: 查询失败 / {:.2f} GB".format(item["limit_gb"]))
+            lines.append("  流量: 查询失败（阈值 {:.2f} GB）".format(item["limit_gb"]))
         else:
             lines.append("  流量: {:.2f} / {:.2f} GB".format(item["traffic_gb"], item["limit_gb"]))
         status = item["status_before"] or "查询失败"
@@ -2144,7 +2300,9 @@ def build_summary(results, started_at, duration, dry_run=False):
         for error in item.get("errors", []):
             if error != item["message"]:
                 lines.append("  错误: {}".format(error))
-    lines.extend(["", "耗时: {:.1f} 秒".format(duration)])
+    lines.extend(["", "耗时: {}".format(format_duration(duration))])
+    if float(duration or 0) >= 600:
+        lines.append("提示: 本轮耗时较长，请检查阿里云 API 出口网络、代理和 SDK 重试配置")
     return "\n".join(lines), error_count, action_count, warning_count
 
 
