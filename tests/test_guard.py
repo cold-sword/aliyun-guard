@@ -831,6 +831,26 @@ class GuardNotificationTests(unittest.TestCase):
         self.assertNotIn(base_url, text)
         self.assertNotIn("secret", text)
 
+    def test_signed_aliyun_request_error_is_short_and_redacted(self):
+        raw = (
+            "SDK.HttpError HTTPSConnectionPool(host='cdt.aliyuncs.com', port=443): "
+            "Max retries exceeded with url: /?Version=2021-08-13&Action="
+            "ListCdtInternetTraffic&Timestamp=2026-08-28T02%3A12%3A53Z&"
+            "SignatureNonce=nonce&AccessKeyId=ak&Signature=signature "
+            "(Caused by SSLError(8, '[SSL: UNEXPECTED_EOF_WHILE_READING] EOF'))"
+        )
+        text = guard.compact_error(RuntimeError(raw), secrets=("ak", "signature"))
+        self.assertEqual(
+            text,
+            "cdt.aliyuncs.com:443：TLS/SSL 连接被对端提前关闭（可能与出口网络、代理或 IPv4/IPv6 路径有关）",
+        )
+        self.assertNotIn("Timestamp", text)
+        self.assertNotIn("SignatureNonce", text)
+        self.assertNotIn("signature", text)
+
+    def test_long_duration_is_human_readable(self):
+        self.assertEqual(guard.format_duration(4666.5), "1 小时 17 分 46.5 秒")
+
     def test_dormant_saved_node_is_redacted_from_errors(self):
         node_uuid = "11111111-1111-1111-1111-111111111111"
         node_url = "vless://{}@example.com:443?security=tls#Saved".format(node_uuid)
@@ -1011,6 +1031,20 @@ class GuardPerformanceCacheTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_durable_atomic_json_write_syncs_parent_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            with mock.patch.object(guard, "fsync_directory") as sync_directory:
+                guard.atomic_write_json(path, {"version": 1})
+            sync_directory.assert_called_once_with(path.parent)
+
+    def test_non_durable_atomic_json_write_skips_parent_directory_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "heartbeat.json"
+            with mock.patch.object(guard, "fsync_directory") as sync_directory:
+                guard.atomic_write_json(path, {"status": "running"}, durable=False)
+            sync_directory.assert_not_called()
+
     def test_ipv4_dns_wrapper_preserves_getaddrinfo_keyword_signature(self):
         ipv6 = (
             guard.socket.AF_INET6,
@@ -1333,10 +1367,10 @@ class ConfigTests(unittest.TestCase):
                 self.action = value
 
             def set_connect_timeout(self, value):
-                pass
+                self.connect_timeout = value
 
             def set_read_timeout(self, value):
-                pass
+                self.read_timeout = value
 
             def add_query_param(self, key, value):
                 self.params[key] = value
@@ -1378,6 +1412,103 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(request.domain, "business.ap-southeast-1.aliyuncs.com")
         self.assertEqual(request.action, "DescribeInstanceBill")
         self.assertEqual(request.params["InstanceID"], "i-test123")
+        self.assertEqual(request.connect_timeout, 5)
+        self.assertEqual(request.read_timeout, 15)
+
+    def test_cdt_query_retries_transient_connection_reset(self):
+        class FakeRequest:
+            def set_protocol_type(self, value):
+                pass
+
+            def set_accept_format(self, value):
+                pass
+
+            def set_method(self, value):
+                pass
+
+            def set_domain(self, value):
+                pass
+
+            def set_version(self, value):
+                pass
+
+            def set_action_name(self, value):
+                pass
+
+            def set_connect_timeout(self, value):
+                pass
+
+            def set_read_timeout(self, value):
+                pass
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = 0
+
+            def do_action_with_exception(self, request):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError(
+                        "SDK.HttpError ('Connection aborted.', "
+                        "ConnectionResetError(104, 'Connection reset by peer'))"
+                    )
+                return json.dumps(
+                    {"TrafficDetails": [{"Traffic": 2 ** 30}]}
+                ).encode("utf-8")
+
+        client = FakeClient()
+        with mock.patch.object(guard, "SDK_IMPORT_ERROR", None), mock.patch.object(
+            guard, "CommonRequest", FakeRequest
+        ), mock.patch.object(guard, "make_client", return_value=client) as make_client, mock.patch.object(
+            guard.time, "sleep"
+        ) as sleep:
+            traffic = guard.query_cdt_traffic_gb(make_user())
+
+        self.assertEqual(traffic, 1.0)
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(make_client.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_cdt_query_does_not_retry_business_error(self):
+        class FakeRequest:
+            def set_protocol_type(self, value):
+                pass
+
+            def set_accept_format(self, value):
+                pass
+
+            def set_method(self, value):
+                pass
+
+            def set_domain(self, value):
+                pass
+
+            def set_version(self, value):
+                pass
+
+            def set_action_name(self, value):
+                pass
+
+            def set_connect_timeout(self, value):
+                pass
+
+            def set_read_timeout(self, value):
+                pass
+
+        client = mock.Mock()
+        client.do_action_with_exception.side_effect = RuntimeError(
+            "InvalidAccessKeyId.NotFound"
+        )
+        with mock.patch.object(guard, "SDK_IMPORT_ERROR", None), mock.patch.object(
+            guard, "CommonRequest", FakeRequest
+        ), mock.patch.object(guard, "make_client", return_value=client), mock.patch.object(
+            guard.time, "sleep"
+        ) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "InvalidAccessKeyId"):
+                guard.query_cdt_traffic_gb(make_user())
+
+        client.do_action_with_exception.assert_called_once()
+        sleep.assert_not_called()
 
     def test_normalizes_bss_item_shapes(self):
         wrapped = {"Data": {"Items": {"Item": [{"PretaxAmount": "1.20"}]}}}
@@ -1425,6 +1556,30 @@ class ConfigTests(unittest.TestCase):
         )
         self.assertEqual(errors, 1)
         self.assertIn("CDT 流量查询失败", summary)
+        self.assertIn("流量: 查询失败（阈值 180.00 GB）", summary)
+
+    def test_summary_warns_when_cycle_is_unusually_long(self):
+        result = {
+            "name": "HK",
+            "instance_id": "i-test123",
+            "traffic_gb": 10.0,
+            "limit_gb": 180.0,
+            "status_before": "Running",
+            "status_after": "Running",
+            "action": "none",
+            "action_performed": False,
+            "level": "ok",
+            "message": "流量安全，实例运行正常",
+            "errors": [],
+            "paused": False,
+            "billing_enabled": False,
+        }
+        summary, errors, _actions, _warnings = guard.build_summary(
+            [result], dt.datetime.now().astimezone(), 4666.5
+        )
+        self.assertEqual(errors, 0)
+        self.assertIn("耗时: 1 小时 17 分 46.5 秒", summary)
+        self.assertIn("本轮耗时较长", summary)
 
     def test_summary_includes_bill_amount_and_bss_error(self):
         base = {
@@ -1652,6 +1807,72 @@ class InstallerTemplateTests(unittest.TestCase):
 
 
 class FirstSetupFlowTests(unittest.TestCase):
+    def test_reset_web_password_persists_and_restarts_native_service(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config = make_config()
+            config["web_panel"].update(
+                {
+                    "enabled": True,
+                    "username": "operator",
+                    "password_hash": manager.web_panel.hash_password(
+                        "previous-password", iterations=1000
+                    ),
+                }
+            )
+            with mock.patch.object(manager, "CONFIG_FILE", config_path), mock.patch.object(
+                guard, "CONFIG_FILE", config_path
+            ), mock.patch.object(
+                manager, "prompt_secret", side_effect=["replacement-password", "replacement-password"]
+            ), mock.patch.object(manager, "run_control", return_value=0) as restart:
+                guard.atomic_write_json(config_path, config)
+                result = manager.reset_web_password()
+                persisted = guard.load_config()["web_panel"]
+        self.assertTrue(result)
+        self.assertTrue(
+            manager.web_panel.verify_password(
+                "replacement-password", persisted["password_hash"]
+            )
+        )
+        self.assertFalse(
+            manager.web_panel.verify_password(
+                "previous-password", persisted["password_hash"]
+            )
+        )
+        restart.assert_called_once_with("restart")
+
+    def test_reset_web_password_rejects_failed_persistence_verification(self):
+        config = make_config()
+        with mock.patch.object(
+            manager, "_set_web_password", return_value="replacement-password"
+        ) as set_password, mock.patch.object(manager, "save_config"), mock.patch.object(
+            manager, "load_config", return_value=config
+        ), mock.patch.object(
+            manager.web_panel, "verify_password", return_value=False
+        ), mock.patch.object(manager, "run_control") as restart:
+            config["web_panel"]["password_hash"] = "old-hash"
+            with self.assertRaises(guard.GuardError):
+                manager.reset_web_password(config)
+        set_password.assert_called_once()
+        restart.assert_not_called()
+
+    def test_reset_web_password_in_container_defers_restart_to_host(self):
+        config = make_config()
+        with mock.patch.object(
+            manager, "_set_web_password", return_value="replacement-password"
+        ) as set_password, mock.patch.object(manager, "save_config"), mock.patch.object(
+            manager, "load_config", return_value=config
+        ), mock.patch.object(
+            manager.web_panel, "verify_password", return_value=True
+        ), mock.patch.object(manager, "run_control") as restart, mock.patch.dict(
+            manager.os.environ, {"ALIYUN_GUARD_CONTAINER": "1"}, clear=False
+        ):
+            set_password.side_effect = lambda web: web.update(
+                {"password_hash": "new-hash"}
+            ) or "replacement-password"
+            self.assertTrue(manager.reset_web_password(config))
+        restart.assert_not_called()
+
     def test_terminal_bot_control_defaults_on_and_accepts_multiple_admins(self):
         telegram = dict(guard.DEFAULT_CONFIG["telegram"])
         telegram["chat_id"] = "123"
@@ -2163,7 +2384,35 @@ class FirstSetupFlowTests(unittest.TestCase):
         self.assertIn(" 9) 定时开关机设置", output.getvalue())
         self.assertIn("10) 网页控制面板", output.getvalue())
         self.assertIn("16) 更新 GitHub 版本  [有新版本 v1.3.0]", output.getvalue())
+        self.assertIn("21) 重置网页登录密码", output.getvalue())
         check.assert_called_once_with()
+
+    def test_menu_dispatches_web_password_reset(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text("{}", encoding="utf-8")
+            config = make_config()
+            config["force_ipv4"] = False
+            with mock.patch.object(manager, "CONFIG_FILE", config_path), mock.patch.object(
+                manager, "load_config", return_value=config
+            ), mock.patch.object(
+                manager, "check_for_github_update", return_value=None
+            ), mock.patch.object(
+                manager, "prompt_int", side_effect=[21, 19]
+            ), mock.patch.object(manager, "prompt", return_value=""), mock.patch.object(
+                manager, "reset_web_password", return_value=True
+            ) as reset:
+                result = manager.menu()
+        self.assertEqual(result, 0)
+        reset.assert_called_once_with(config)
+
+    def test_reset_web_password_command_dispatches_directly(self):
+        with mock.patch.object(
+            manager, "reset_web_password", return_value=True
+        ) as reset:
+            result = manager.main(["reset-web-password"])
+        self.assertEqual(result, 0)
+        reset.assert_called_once_with()
 
     def test_menu_test_action_does_not_open_connection_settings(self):
         with tempfile.TemporaryDirectory() as directory:
