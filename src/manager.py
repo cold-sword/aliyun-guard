@@ -30,7 +30,7 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.21"
+APP_VERSION = "1.6.22"
 LOCAL_RELEASE_ID = "__AG_RELEASE_ID__"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
@@ -213,6 +213,32 @@ def choose_region(current=None):
     if selection <= len(REGIONS):
         return REGIONS[selection - 1][0]
     return prompt("Region ID（例如 cn-hongkong）", current, required=True)
+
+
+def choose_stop_mode(existing=None, config=None, allow_inherit=True):
+    existing = existing or {}
+    current = str(existing.get("stop_mode", "") or "").strip()
+    global_mode = guard.get_stop_mode({}, config) if config else guard.DEFAULT_STOP_MODE
+    global_label = (
+        "普通停机，继续计费" if global_mode == "KeepCharging" else "节省停机，回收计算资源"
+    )
+    options = []
+    if allow_inherit:
+        options.append(("", "跟随全局默认（{}）".format(global_label)))
+    options.append(("KeepCharging", "普通停机（停止后继续计费，保留全部资源）"))
+    options.append(("StopCharging", "节省停机（停止后回收计算资源，重启可能因库存失败）"))
+    print("\n实例停机模式：")
+    default_index = 1
+    found = False
+    for index, (value, label) in enumerate(options, 1):
+        marker = "（当前）" if value == current else ""
+        print(" {}) {}{}".format(index, label, marker))
+        if value == current:
+            default_index = index
+            found = True
+    if not found:
+        default_index = 1
+    return options[prompt_int("模式序号", default_index, 1, len(options)) - 1][0]
 
 
 def configure_billing(existing_user=None):
@@ -910,7 +936,7 @@ def collect_schedule(existing_user=None, ask_enabled=True):
         return schedule
 
 
-def collect_user(existing=None):
+def collect_user(existing=None, config=None):
     existing = dict(existing or {})
     title("{}监控实例".format("编辑" if existing else "添加"))
     user = dict(existing)
@@ -928,6 +954,11 @@ def collect_user(existing=None):
     user["traffic_limit_gb"] = prompt_float(
         "当月 CDT 流量关机阈值（GB）", existing.get("traffic_limit_gb", 180), 0.01
     )
+    stop_mode = choose_stop_mode(existing, config)
+    if stop_mode:
+        user["stop_mode"] = stop_mode
+    else:
+        user.pop("stop_mode", None)
     user["actions_enabled"] = yes_no(
         "允许脚本自动启动/停止该实例", bool(existing.get("actions_enabled", True))
     )
@@ -966,7 +997,7 @@ def test_user(user, config):
 
 def add_user(config, require_success=False):
     while True:
-        user = collect_user()
+        user = collect_user(config=config)
         duplicate = any(
             item.get("ak") == user.get("ak")
             and item.get("region") == user.get("region")
@@ -998,7 +1029,7 @@ def list_users(config):
     if not users:
         print("当前没有监控实例。")
         return
-    print("序号  状态    名称                  Region                实例 ID                 定时计划               账单       AccessKey")
+    print("序号  状态    名称                  Region                实例 ID                 定时计划               账单      停模      AccessKey")
     line("-")
     for index, user in enumerate(users, 1):
         status = "暂停" if user.get("paused") else "运行"
@@ -1008,8 +1039,15 @@ def list_users(config):
             "international": "国际站",
             "custom": "自定义",
         }.get(billing.get("site"), "自定义") if billing.get("enabled", True) else "关闭"
+        stop_mode = user.get("stop_mode", "")
+        if not stop_mode:
+            stop_mode = "全局"
+        elif stop_mode == "KeepCharging":
+            stop_mode = "普通"
+        else:
+            stop_mode = "节省"
         print(
-            "{:<5} {:<7} {:<21} {:<21} {:<23} {:<22} {:<10} {}".format(
+            "{:<5} {:<7} {:<21} {:<21} {:<23} {:<22} {:<10} {:<8} {}".format(
                 index,
                 status,
                 str(user.get("name", ""))[:20],
@@ -1017,6 +1055,7 @@ def list_users(config):
                 str(user.get("instance_id", ""))[:22],
                 schedule_text(user),
                 bill_site,
+                stop_mode,
                 mask_key(user.get("ak")),
             )
         )
@@ -1036,7 +1075,7 @@ def edit_user(config):
     index = choose_user(config, "编辑")
     if index is None:
         return
-    candidate = collect_user(config["users"][index])
+    candidate = collect_user(config["users"][index], config)
     if test_user(candidate, config) or yes_no("校验失败，仍保存修改", False):
         config["users"][index] = candidate
         save_config(config)
@@ -1247,6 +1286,7 @@ def edit_settings(config):
     config["stop_wait_seconds"] = prompt_int(
         "停止实例后等待确认时间（秒）", config.get("stop_wait_seconds", 45), 0, 600
     )
+    config["stop_mode"] = choose_stop_mode(config, config, allow_inherit=False)
     current_watchdog = config.get("watchdog", {})
     if not isinstance(current_watchdog, dict):
         current_watchdog = {}
