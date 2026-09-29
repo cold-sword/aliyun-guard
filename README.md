@@ -2,7 +2,7 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.6.20-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.6.22-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
 ![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
@@ -29,7 +29,7 @@ Aliyun Guard 是一个面向阿里云 ECS 的网页、终端与 Telegram 守护�
 
 Aliyun Guard 将能力分成四组，便于按需启用：
 
-- **流量与 ECS**：CDT 阈值止损、低流量自动恢复、月初重置补检、每日开关机计划、多账号/多地域/多实例、独立日志与 ECS 自动发现。
+- **流量与 ECS**：CDT 阈值止损、低流量自动恢复、月初重置补检、每日开关机计划、普通/节省停机模式选择、多账号/多地域/多实例、独立日志与 ECS 自动发现。
 - **管理入口**：响应式网页控制台、交互式终端面板、演练检测、手动开关机、日志、服务管理与 GitHub 更新。
 - **通知网络**：Telegram 每轮汇总、事件/错误通知模式、直连与 SOCKS5/HTTP/HTTPS/API 反代、多协议节点、订阅刷新、管理员 Bot 单消息控制与危险操作确认。
 - **备份运维**：AES-256-GCM 加密备份、恢复预览、程序快照回滚、AWS S3/R2/MinIO 异地备份、watchdog 失联自愈、并发保护与凭据脱敏。
@@ -62,6 +62,7 @@ flowchart LR
 | CDT 流量、阈值与趋势 | ✅ | ✅ | ✅ | ✅ |
 | 月度额度重置倒计时 | ✅ | — | — | ✅ 月初补检 |
 | ECS 开关机与每日计划 | ✅ | ✅ | ✅ | ✅ |
+| 停机模式（普通/节省） | ✅ | ✅ | — | ✅ 自动关机 |
 | BSS 账单与缓存刷新 | ✅ | ✅ | 状态查看 | ✅ |
 | 多节点 Telegram 连接 | ✅ | ✅ | — | ✅ 自动刷新 |
 | 加密备份、恢复与回滚 | ✅ | ✅ | — | ✅ 可选 S3 |
@@ -91,6 +92,8 @@ flowchart LR
 - 进入计划运行时段时，只有 CDT 流量低于阈值才允许开机；流量达到阈值时保持关机。
 - 后台每分钟轻量检查一次计划边界，完整 CDT、ECS、BSS 查询仍按“检测间隔”执行。
 - 服务在计划边界暂时离线时，恢复后会比较当前目标时段并补偿执行，不要求刚好在整分钟在线。
+
+> 自动关机（流量达到阈值或进入计划关机时段）会按实例配置的停机模式调用 `StopInstance`。停机模式支持 `KeepCharging`（普通停机，默认）与 `StopCharging`（节省停机）；实例可单独设置，未设置时跟随全局默认，手动、定时与 Telegram Bot 关机使用同一模式。详见下文“停机模式”。
 
 ### CDT 月度额度重置
 
@@ -183,7 +186,7 @@ flowchart TD
 21) 重置网页登录密码
 ```
 
-面板标题始终显示当前版本号，例如 `阿里云保活与通知 v1.6.20 - 管理面板`。发现更新时，标题下方和第 16 项会显示黄色的新版本提示；启动检查超时或 GitHub 暂时不可用不会阻塞其他管理操作，也不会自动安装更新。设置 `NO_COLOR=1` 或将输出重定向到文件时，提示会自动退回纯文本。
+面板标题始终显示当前版本号，例如 `阿里云保活与通知 v1.6.22 - 管理面板`。发现更新时，标题下方和第 16 项会显示黄色的新版本提示；启动检查超时或 GitHub 暂时不可用不会阻塞其他管理操作，也不会自动安装更新。设置 `NO_COLOR=1` 或将输出重定向到文件时，提示会自动退回纯文本。
 
 ## Telegram Bot 控制
 
@@ -268,7 +271,7 @@ http://127.0.0.1:8765
 - API 不返回 AccessKey、AccessKey Secret、Bot Token、原始代理 URL、代理凭据、节点原链接或网页登录密码哈希，只返回“是否已保存”和不含凭据的连接说明。
 - 编辑敏感参数时输入框不会回填星号或旧值；已配置字段统一提示“已保存，留空不修改”，留空时后端保留原值。
 - 新增节点必须先通过到 Telegram Bot API 的 3 次往返延迟检测和测试消息，成功后才保存；保存新节点不会擅自切换当前连接方式。
-- 网页或 Telegram 手动开机仍检查 CDT 阈值；手动关机会自动暂停该实例监控，流量安全的手动开机会自动恢复监控，不需要先手动切换监控状态。
+- 网页或 Telegram 手动开机仍检查 CDT 阈值：流量达到阈值时网页会先提示当前流量并要求二次确认，确认后强制开机并自动暂停该实例监控，避免下一轮再次被自动关机；手动关机会自动暂停该实例监控，流量安全的手动开机会自动恢复监控，不需要先手动切换监控状态。
 
 systemd 和 OpenRC 环境中，网页面板随 `aliyun-guard` 后台服务启动。cron 回退环境会每分钟轻量检查网页进程并在需要时恢复。查看入口和运行方式：
 
@@ -728,7 +731,7 @@ Docker 部署继续由 Compose 的 `restart: unless-stopped` 负责进程退出�
 
 ## 从 GitHub 更新
 
-例如当前发布版本为 `v1.6.20`。若网页更新失败，先在服务器终端执行 `sudo /opt/aliyun-guard/control.sh update` 查看具体错误；Docker 部署请在 Compose 目录执行 `docker compose up -d --build`。
+例如当前发布版本为 `v1.6.22`。若网页更新失败，先在服务器终端执行 `sudo /opt/aliyun-guard/control.sh update` 查看具体错误；Docker 部署请在 Compose 目录执行 `docker compose up -d --build`。
 
 ```sh
 aliyun-guard update
@@ -767,6 +770,27 @@ aliyun-guard update
 每个实例拥有独立计划。主面板“查看监控实例”会显示计划时段，`aliyun-guard status` 会显示已启用计划数量和下一次动作。关闭计划只取消时间约束，不会立即改变 ECS 当前状态；暂停实例则会同时暂停流量、账单、状态查询和全部自动开关机。
 
 旧版本升级到 `v1.2.8` 后，已有实例的计划默认关闭，不会因更新突然开机或关机。设置计划后，后台会在 1 分钟内读取新配置，无需手动重启服务。
+
+## 停机模式
+
+阿里云 ECS 的 `StopInstance` 支持两种停机模式。Aliyun Guard 的所有自动关机（流量阈值、定时计划）与手动关机（网页、CLI、Telegram Bot）都会按所选模式调用 `StopInstance`，参数为 `StoppedMode`：
+
+| 配置值 | 名称 | 说明 |
+|---|---|---|
+| `KeepCharging` | 普通停机（默认） | 停止后保留全部资源并继续计费；重启速度快、成功率高，公网 IP 不变。 |
+| `StopCharging` | 节省停机 | 停止后回收 vCPU、内存、GPU 等计算资源，相关费用暂停；系统盘、数据盘、EIP 等继续计费。重启需重新申请计算资源，可能因库存不足失败，且固定公网 IP 可能变化。 |
+
+配置方式：
+
+- **全局默认**：终端 `aliyun-guard` → `13) 修改全局设置`，或网页“设置”页的“默认停机模式”。
+- **实例覆盖**：终端添加或编辑监控实例时选择，或网页实例编辑对话框的“停机模式”下拉框（“跟随全局默认 / 普通停机 / 节省停机”）。
+- 实例未单独设置时跟随全局默认。升级后默认值始终为 `KeepCharging`，不会因升级突然改变现有停机方式；停机模式会显示在网页实例卡片与终端“查看监控实例”列表中。
+
+注意事项：
+
+- `StopCharging` 仅对按量付费（含抢占式）实例生效；包年包月、本地盘等不支持节省停机的实例类型调用后不会报错，会按普通模式正常停机。
+- 节省停机适合“较长时间内不需要运行”的场景；短暂停机后立刻开机建议使用普通停机，避免公网 IP 变化与重启失败。
+- 停机模式无法在停止状态下直接切换，需要先启动实例后再以新模式停止。
 
 ## 暂停和恢复实例
 

@@ -4231,8 +4231,10 @@ def _billing_payload(guard, user):
     }
 
 
-def _instance_payload(guard, user, index):
+def _instance_payload(guard, user, index, config=None):
     schedule = guard.get_schedule_config(user)
+    if config is None:
+        config = guard.load_config()
     return {
         "index": index,
         "name": str(user.get("name", "")),
@@ -4244,6 +4246,8 @@ def _instance_payload(guard, user, index):
         "actions_enabled": bool(user.get("actions_enabled", True)),
         "instance_log_enabled": bool(user.get("instance_log_enabled", False)),
         "paused": bool(user.get("paused", False)),
+        "stop_mode": guard.get_stop_mode(user, config),
+        "stop_mode_inherited": not str(user.get("stop_mode", "") or "").strip(),
         "billing": _billing_payload(guard, user),
         "schedule": {
             "enabled": schedule["enabled"],
@@ -4299,7 +4303,7 @@ def management_payload(guard, backend="unknown"):
     web = raw_web if isinstance(raw_web, dict) else {}
     return {
         "instances": [
-            _instance_payload(guard, user, index)
+            _instance_payload(guard, user, index, config)
             for index, user in enumerate(config.get("users", []))
         ],
         "telegram": telegram_payload(guard, config.get("telegram", {})),
@@ -4312,6 +4316,12 @@ def management_payload(guard, backend="unknown"):
             "start_wait_seconds": int(config.get("start_wait_seconds", 90)),
             "stop_wait_seconds": int(config.get("stop_wait_seconds", 45)),
             "start_poll_seconds": int(config.get("start_poll_seconds", 5)),
+            "stop_mode": str(
+                config.get(
+                    "stop_mode",
+                    guard.DEFAULT_STOP_MODE,
+                )
+            ),
             "watchdog": {
                 "enabled": bool(config.get("watchdog", {}).get("enabled", True)),
                 "timeout_seconds": int(
@@ -4811,6 +4821,16 @@ def build_instance_candidate(guard, data, existing=None):
         bool(existing.get("instance_log_enabled", False)),
     )
     candidate["paused"] = bool(existing.get("paused", False))
+    if "stop_mode" in data:
+        raw_stop_mode = str(data.get("stop_mode", "") or "").strip()
+        if raw_stop_mode:
+            candidate["stop_mode"] = guard.normalize_stop_mode(raw_stop_mode)
+        else:
+            candidate.pop("stop_mode", None)
+    elif "stop_mode" in existing:
+        candidate["stop_mode"] = guard.normalize_stop_mode(
+            existing.get("stop_mode")
+        )
     candidate["billing"] = _normalize_billing(
         guard, data.get("billing"), existing
     )
@@ -4954,6 +4974,8 @@ def update_global_settings(guard, data):
     config["start_poll_seconds"] = _integer(
         data, "start_poll_seconds", config.get("start_poll_seconds", 5), 1, 60
     )
+    if "stop_mode" in data:
+        config["stop_mode"] = guard.normalize_stop_mode(data.get("stop_mode"))
     watchdog_data = data.get("watchdog", {})
     if not isinstance(watchdog_data, dict):
         raise ManagementError("watchdog 必须是对象")
@@ -5733,7 +5755,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.15"
+APP_VERSION = "1.6.22"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -5757,9 +5779,10 @@ DEFAULT_WEB_CONFIG = {
 
 
 class WebPanelError(RuntimeError):
-    def __init__(self, message, status=400):
+    def __init__(self, message, status=400, details=None):
         super().__init__(message)
         self.status = status
+        self.details = details
 
 
 def hash_password(password, iterations=PASSWORD_ITERATIONS):
@@ -5973,6 +5996,7 @@ def dashboard_payload(guard, config=None, state=None, job=None):
                 "instance_log_enabled": bool(
                     user.get("instance_log_enabled", False)
                 ),
+                "stop_mode": guard.get_stop_mode(user, config),
                 "traffic_gb": traffic,
                 "traffic_limit_gb": limit,
                 "traffic_percent": percent,
@@ -6266,10 +6290,17 @@ def control_instance(
                 if traffic >= limit:
                     if not allow_threshold_override:
                         raise WebPanelError(
-                            "当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值，拒绝开机".format(
+                            "当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值，请二次确认后强制开机".format(
                                 traffic, limit
                             ),
                             409,
+                            details={
+                                "reason": "threshold",
+                                "traffic_gb": round(traffic, 2),
+                                "limit_gb": limit,
+                                "instance_id": str(user.get("instance_id", "")),
+                                "name": name,
+                            },
                         )
                     threshold_overridden = True
                 if threshold_overridden and pause_on_threshold_override:
@@ -6295,7 +6326,7 @@ def control_instance(
                             guard, user, False
                         )
             elif before != "Stopped":
-                guard.stop_instance(user)
+                guard.stop_instance(user, guard.get_stop_mode(user, config))
                 performed = True
                 monitor_paused = _set_instance_monitor_state(
                     guard, user, True
@@ -6783,7 +6814,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 payload["details"] = exc.details
             self._json(payload, exc.status)
         except WebPanelError as exc:
-            self._json({"ok": False, "error": str(exc)}, exc.status)
+            payload = {"ok": False, "error": str(exc)}
+            if exc.details is not None:
+                payload["details"] = exc.details
+            self._json(payload, exc.status)
         except Exception as exc:
             self._json({"ok": False, "error": "服务器内部错误"}, 500)
             self.server.guard.LOGGER.exception("Web GET error: %s", exc)
@@ -7003,7 +7037,14 @@ class PanelHandler(BaseHTTPRequestHandler):
                     self._json({"ok": True, "result": result})
                     return
                 if parts[3] == "power":
-                    result = control_instance(self.server.guard, index, data.get("action"))
+                    force = bool(data.get("force", False))
+                    result = control_instance(
+                        self.server.guard,
+                        index,
+                        data.get("action"),
+                        allow_threshold_override=force,
+                        pause_on_threshold_override=force,
+                    )
                     self._json({"ok": True, "result": result})
                     return
             raise WebPanelError("接口不存在", 404)
@@ -7013,7 +7054,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 payload["details"] = exc.details
             self._json(payload, exc.status)
         except WebPanelError as exc:
-            self._json({"ok": False, "error": str(exc)}, exc.status)
+            payload = {"ok": False, "error": str(exc)}
+            if exc.details is not None:
+                payload["details"] = exc.details
+            self._json(payload, exc.status)
         except Exception as exc:
             self._json({"ok": False, "error": "服务器内部错误"}, 500)
             self.server.guard.LOGGER.exception("Web POST error: %s", exc)
@@ -7764,7 +7808,7 @@ __AG_WEB_PY_EOF__
     .menu-button:disabled { opacity: .5; cursor: not-allowed; }
 
     .card-body { padding: 16px 18px 12px; display: flex; flex-direction: column; flex: 1 0 auto; }
-    .metric-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+    .metric-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; }
     .metric { min-width: 0; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 9px 11px; }
     .metric-label { color: var(--faint); font-size: 11px; font-weight: 600; }
     .metric-value { margin-top: 3px; font-weight: 700; font-size: 13.5px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
@@ -8037,7 +8081,7 @@ __AG_WEB_PY_EOF__
     .dialog-head h2 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: -.01em; }
     .dialog-body { padding: 20px 18px; max-height: min(66vh, 620px); overflow: auto; }
     .dialog-actions { padding: 13px 18px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; background: var(--surface-2); border-radius: 0 0 var(--radius-l) var(--radius-l); }
-    .confirm-message { margin: 0; color: var(--ink-soft); font-size: 13.5px; line-height: 1.6; }
+    .confirm-message { margin: 0; color: var(--ink-soft); font-size: 13.5px; line-height: 1.6; white-space: pre-line; }
 
     /* ---------- Toasts ---------- */
     .toasts {
@@ -8308,6 +8352,7 @@ __AG_WEB_PY_EOF__
               <label class="check-row"><input id="notifyOnStart" type="checkbox">服务启动时发送通知</label>
               <div class="field"><label for="startWait">开机确认等待（秒）</label><input id="startWait" type="number" min="0" max="600" required></div>
               <div class="field"><label for="stopWait">关机确认等待（秒）</label><input id="stopWait" type="number" min="0" max="600" required></div>
+              <div class="field"><label for="globalStopMode">默认停机模式</label><select id="globalStopMode"><option value="KeepCharging">普通停机（继续计费）</option><option value="StopCharging">节省停机（回收计算资源）</option></select></div>
               <div class="field"><label for="pollSeconds">状态轮询间隔（秒）</label><input id="pollSeconds" type="number" min="1" max="60" required></div>
               <label class="check-row wide"><input id="watchdogEnabled" type="checkbox">启用监控失联看门狗</label>
               <div class="field"><label for="watchdogTimeout">心跳超时（秒）</label><input id="watchdogTimeout" type="number" min="120" max="86400" required></div>
@@ -8438,6 +8483,7 @@ __AG_WEB_PY_EOF__
           <div class="field"><label for="instanceAk">AccessKey ID</label><input id="instanceAk" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
           <div class="field"><label for="instanceSk">AccessKey Secret</label><input id="instanceSk" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
           <div class="field"><label for="trafficLimit">CDT 关机阈值（GB）</label><input id="trafficLimit" type="number" min="0.01" step="0.01" required></div>
+          <div class="field"><label for="instanceStopMode">停机模式</label><select id="instanceStopMode"><option value="">跟随全局默认</option><option value="KeepCharging">普通停机（继续计费）</option><option value="StopCharging">节省停机（回收计算资源）</option></select></div>
           <label class="check-row"><input id="actionsEnabled" type="checkbox">允许自动开机与关机</label>
           <label class="check-row"><input id="instanceLogEnabled" type="checkbox">记录该实例独立日志</label>
           <label class="check-row"><input id="billingEnabled" type="checkbox">查询本月实例账单</label>
@@ -8703,6 +8749,7 @@ __AG_WEB_PY_EOF__
             <div class="metric"><div class="metric-label">CDT 流量</div><div class="metric-value">${fmtNum(item.traffic_gb)} GB</div></div>
             <div class="metric"><div class="metric-label">关机阈值</div><div class="metric-value">${fmtNum(item.traffic_limit_gb)} GB</div></div>
             <div class="metric"${billTitle}><div class="metric-label">本月账单</div><div class="metric-value">${bill}</div></div>
+            <div class="metric" title="${item.stop_mode === "StopCharging" ? "节省停机：停止后回收计算资源，重启可能因库存失败，公网 IP 可能变化" : "普通停机：停止后继续计费，保留全部资源"}"><div class="metric-label">停机模式</div><div class="metric-value">${item.stop_mode === "StopCharging" ? "节省停机" : "普通停机"}</div></div>
             <div class="metric"><div class="metric-label">每日计划</div><div class="metric-value">${sched}</div></div>
           </div>
           <div class="traffic-row"><span>本月流量使用率</span><strong>${item.traffic_percent === null ? "--" : fmtNum(item.traffic_percent, 1) + "%"}</strong></div>
@@ -8790,6 +8837,7 @@ __AG_WEB_PY_EOF__
       $("notifyOnStart").checked = settings.notify_on_daemon_start;
       $("startWait").value = settings.start_wait_seconds;
       $("stopWait").value = settings.stop_wait_seconds;
+      $("globalStopMode").value = settings.stop_mode;
       $("pollSeconds").value = settings.start_poll_seconds;
       $("watchdogEnabled").checked = settings.watchdog.enabled;
       $("watchdogTimeout").value = settings.watchdog.timeout_seconds;
@@ -9002,6 +9050,7 @@ __AG_WEB_PY_EOF__
       $("instanceAk").placeholder = existing?.access_key_configured ? "已保存，留空不修改" : "请输入 AccessKey ID";
       $("instanceSk").placeholder = existing?.secret_key_configured ? "已保存，留空不修改" : "请输入 AccessKey Secret";
       $("trafficLimit").value = existing?.traffic_limit_gb ?? 180;
+      $("instanceStopMode").value = existing?.stop_mode_inherited ? "" : (existing?.stop_mode || "");
       $("actionsEnabled").checked = existing?.actions_enabled ?? true;
       $("instanceLogEnabled").checked = existing?.instance_log_enabled ?? false;
       $("billingEnabled").checked = existing?.billing.enabled ?? true;
@@ -9026,6 +9075,7 @@ __AG_WEB_PY_EOF__
         region: $("instanceRegion").value.trim(),
         instance_id: $("instanceId").value.trim(),
         traffic_limit_gb: Number($("trafficLimit").value),
+        stop_mode: $("instanceStopMode").value,
         actions_enabled: $("actionsEnabled").checked,
         instance_log_enabled: $("instanceLogEnabled").checked,
         billing: {
@@ -9218,7 +9268,28 @@ __AG_WEB_PY_EOF__
         const confirmed = await confirmAction({ title: action === "start" ? "开机实例" : "关机实例", message: `确认${action === "start" ? "开机" : "关机"} ${item.name}？`, confirmText: action === "start" ? "开机" : "关机", tone: action === "start" ? "primary" : "warning" });
         if (!confirmed) return;
         button.disabled = true;
-        try { const data = await api(`/api/instances/${index}/power`, { method: "POST", body: { action } }); toast(data.result.notification_error ? `操作成功，Telegram 通知失败：${data.result.notification_error}` : "实例操作已完成", Boolean(data.result.notification_error)); await loadDashboard(); } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
+        try {
+          try {
+            const data = await api(`/api/instances/${index}/power`, { method: "POST", body: { action } });
+            toast(data.result.notification_error ? `操作成功，Telegram 通知失败：${data.result.notification_error}` : "实例操作已完成", Boolean(data.result.notification_error));
+            await loadDashboard();
+          } catch (error) {
+            if (action === "start" && error.details && error.details.reason === "threshold") {
+              const force = await confirmAction({
+                title: "流量已到关机阈值",
+                message: `${error.details.name} 当前 CDT 流量 ${fmtNum(error.details.traffic_gb)} GB 已达到 ${fmtNum(error.details.limit_gb)} GB 阈值。\n确认强制开机？该实例监控将自动暂停，避免下一轮再次被自动关机。`,
+                confirmText: "强制开机",
+                tone: "warning",
+              });
+              if (!force) return;
+              const data = await api(`/api/instances/${index}/power`, { method: "POST", body: { action, force: true } });
+              toast(data.result.notification_error ? `强制开机成功，Telegram 通知失败：${data.result.notification_error}` : "已强制开机并暂停该实例监控", Boolean(data.result.notification_error));
+              await loadDashboard();
+            } else {
+              toast(error.message, true);
+            }
+          }
+        } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
       }
     });
 
@@ -9288,6 +9359,7 @@ __AG_WEB_PY_EOF__
           start_wait_seconds: Number($("startWait").value),
           stop_wait_seconds: Number($("stopWait").value),
           start_poll_seconds: Number($("pollSeconds").value),
+          stop_mode: $("globalStopMode").value,
           watchdog: { enabled: $("watchdogEnabled").checked, timeout_seconds: Number($("watchdogTimeout").value), failure_threshold: Number($("watchdogFailures").value) },
         } });
         toast("全局设置已保存");
@@ -9762,6 +9834,7 @@ DEFAULT_CONFIG = {
     "start_wait_seconds": 90,
     "stop_wait_seconds": 45,
     "start_poll_seconds": 5,
+    "stop_mode": "KeepCharging",
     "watchdog": {
         "enabled": True,
         "timeout_seconds": 600,
@@ -9796,6 +9869,10 @@ _JSON_WRITE_LOCK = threading.RLock()
 _INSTANCE_LOG_LOCK = threading.Lock()
 MAX_ECS_STATUS_BATCH_CALLS = 32
 _TELEGRAM_LOCAL = threading.local()
+
+# 阿里云 ECS StopInstance 的 StoppedMode 参数：KeepCharging=普通停机模式，StopCharging=节省停机模式。
+STOP_MODES = ("KeepCharging", "StopCharging")
+DEFAULT_STOP_MODE = "KeepCharging"
 
 # 阿里云 SDK 对可重试的 HTTP 错误可能进行额外重试。检测服务是周期任务，
 # 请求失败时应尽快结束本轮并保留下一轮重试机会，不能让一次网络故障阻塞数十分钟。
@@ -10073,6 +10150,11 @@ def validate_config(config):
     mode = config.get("notification_mode")
     if mode not in ("always", "events", "errors"):
         raise GuardError("notification_mode 必须是 always、events 或 errors")
+    if "stop_mode" in config:
+        try:
+            normalize_stop_mode(config["stop_mode"])
+        except GuardError as exc:
+            raise GuardError("全局停机模式无效: {}".format(exc))
     watchdog = config.get("watchdog", {})
     if not isinstance(watchdog, dict):
         raise GuardError("watchdog 必须是对象")
@@ -10143,6 +10225,11 @@ def validate_config(config):
             for field in ("endpoint", "region", "currency_code", "currency_symbol"):
                 if not str(billing.get(field, "")).strip():
                     raise GuardError("第 {} 个实例的账单配置缺少 {}".format(index, field))
+        if "stop_mode" in user:
+            try:
+                normalize_stop_mode(user["stop_mode"])
+            except GuardError as exc:
+                raise GuardError("第 {} 个实例的停机模式无效: {}".format(index, exc))
 
 
 def validate_telegram_config(telegram):
@@ -10569,6 +10656,25 @@ def normalize_schedule_time(value, field_name="时间"):
     if hour > 23 or minute > 59:
         raise GuardError("{}超出有效范围".format(field_name))
     return "{:02d}:{:02d}".format(hour, minute)
+
+
+def normalize_stop_mode(value):
+    """Normalize and validate one stop mode value."""
+    mode = str(value or "").strip()
+    if mode and mode not in STOP_MODES:
+        raise GuardError(
+            "停机模式必须为 KeepCharging（普通停机）或 StopCharging（节省停机）"
+        )
+    return mode or DEFAULT_STOP_MODE
+
+
+def get_stop_mode(user, config=None):
+    """Return the effective stop mode for a user: instance override, then global default."""
+    if isinstance(user, dict) and str(user.get("stop_mode", "") or "").strip():
+        return normalize_stop_mode(user.get("stop_mode"))
+    if isinstance(config, dict) and str(config.get("stop_mode", "") or "").strip():
+        return normalize_stop_mode(config.get("stop_mode"))
+    return DEFAULT_STOP_MODE
 
 
 def get_schedule_config(user):
@@ -11104,12 +11210,15 @@ def start_instance(user):
     make_client(user).do_action_with_exception(request)
 
 
-def stop_instance(user):
+def stop_instance(user, stop_mode=None):
     require_sdk()
     request = StopInstanceRequest()
     request.set_protocol_type("https")
     request.set_accept_format("json")
     request.set_InstanceId(str(user["instance_id"]).strip())
+    effective_mode = normalize_stop_mode(stop_mode)
+    if effective_mode != DEFAULT_STOP_MODE:
+        request.set_StoppedMode(effective_mode)
     configure_aliyun_request(request)
     make_client(user).do_action_with_exception(request)
 
@@ -11718,7 +11827,7 @@ def check_one(
                 result["message"] = "当前处于计划关机时段，但自动操作未启用"
             else:
                 try:
-                    stop_instance(user)
+                    stop_instance(user, get_stop_mode(user, config))
                     result["action_performed"] = True
                     LOGGER.info("[%s] 已提交定时关机请求", name)
                     latest, poll_error = wait_for_status(
@@ -11841,7 +11950,7 @@ def check_one(
                 result["message"] = "流量达到阈值，但自动操作未启用"
             else:
                 try:
-                    stop_instance(user)
+                    stop_instance(user, get_stop_mode(user, config))
                     result["action_performed"] = True
                     LOGGER.warning("[%s] 流量达到阈值，已提交停止请求", name)
                     latest, poll_error = wait_for_status(user, "Stopped", stop_wait_seconds, poll_seconds)
@@ -12710,8 +12819,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.21"
-LOCAL_RELEASE_ID = "f2ae209455a9fe67459611751d77c7f6b36b4965640113436f9c80a4f1542332"
+APP_VERSION = "1.6.22"
+LOCAL_RELEASE_ID = "ae462cb2a800f0164e4a536e75cb1dfb76a7d32ef9e56d6cf4bedc75e67a31a1"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
@@ -12893,6 +13002,32 @@ def choose_region(current=None):
     if selection <= len(REGIONS):
         return REGIONS[selection - 1][0]
     return prompt("Region ID（例如 cn-hongkong）", current, required=True)
+
+
+def choose_stop_mode(existing=None, config=None, allow_inherit=True):
+    existing = existing or {}
+    current = str(existing.get("stop_mode", "") or "").strip()
+    global_mode = guard.get_stop_mode({}, config) if config else guard.DEFAULT_STOP_MODE
+    global_label = (
+        "普通停机，继续计费" if global_mode == "KeepCharging" else "节省停机，回收计算资源"
+    )
+    options = []
+    if allow_inherit:
+        options.append(("", "跟随全局默认（{}）".format(global_label)))
+    options.append(("KeepCharging", "普通停机（停止后继续计费，保留全部资源）"))
+    options.append(("StopCharging", "节省停机（停止后回收计算资源，重启可能因库存失败）"))
+    print("\n实例停机模式：")
+    default_index = 1
+    found = False
+    for index, (value, label) in enumerate(options, 1):
+        marker = "（当前）" if value == current else ""
+        print(" {}) {}{}".format(index, label, marker))
+        if value == current:
+            default_index = index
+            found = True
+    if not found:
+        default_index = 1
+    return options[prompt_int("模式序号", default_index, 1, len(options)) - 1][0]
 
 
 def configure_billing(existing_user=None):
@@ -13590,7 +13725,7 @@ def collect_schedule(existing_user=None, ask_enabled=True):
         return schedule
 
 
-def collect_user(existing=None):
+def collect_user(existing=None, config=None):
     existing = dict(existing or {})
     title("{}监控实例".format("编辑" if existing else "添加"))
     user = dict(existing)
@@ -13608,6 +13743,11 @@ def collect_user(existing=None):
     user["traffic_limit_gb"] = prompt_float(
         "当月 CDT 流量关机阈值（GB）", existing.get("traffic_limit_gb", 180), 0.01
     )
+    stop_mode = choose_stop_mode(existing, config)
+    if stop_mode:
+        user["stop_mode"] = stop_mode
+    else:
+        user.pop("stop_mode", None)
     user["actions_enabled"] = yes_no(
         "允许脚本自动启动/停止该实例", bool(existing.get("actions_enabled", True))
     )
@@ -13646,7 +13786,7 @@ def test_user(user, config):
 
 def add_user(config, require_success=False):
     while True:
-        user = collect_user()
+        user = collect_user(config=config)
         duplicate = any(
             item.get("ak") == user.get("ak")
             and item.get("region") == user.get("region")
@@ -13678,7 +13818,7 @@ def list_users(config):
     if not users:
         print("当前没有监控实例。")
         return
-    print("序号  状态    名称                  Region                实例 ID                 定时计划               账单       AccessKey")
+    print("序号  状态    名称                  Region                实例 ID                 定时计划               账单      停模      AccessKey")
     line("-")
     for index, user in enumerate(users, 1):
         status = "暂停" if user.get("paused") else "运行"
@@ -13688,8 +13828,15 @@ def list_users(config):
             "international": "国际站",
             "custom": "自定义",
         }.get(billing.get("site"), "自定义") if billing.get("enabled", True) else "关闭"
+        stop_mode = user.get("stop_mode", "")
+        if not stop_mode:
+            stop_mode = "全局"
+        elif stop_mode == "KeepCharging":
+            stop_mode = "普通"
+        else:
+            stop_mode = "节省"
         print(
-            "{:<5} {:<7} {:<21} {:<21} {:<23} {:<22} {:<10} {}".format(
+            "{:<5} {:<7} {:<21} {:<21} {:<23} {:<22} {:<10} {:<8} {}".format(
                 index,
                 status,
                 str(user.get("name", ""))[:20],
@@ -13697,6 +13844,7 @@ def list_users(config):
                 str(user.get("instance_id", ""))[:22],
                 schedule_text(user),
                 bill_site,
+                stop_mode,
                 mask_key(user.get("ak")),
             )
         )
@@ -13716,7 +13864,7 @@ def edit_user(config):
     index = choose_user(config, "编辑")
     if index is None:
         return
-    candidate = collect_user(config["users"][index])
+    candidate = collect_user(config["users"][index], config)
     if test_user(candidate, config) or yes_no("校验失败，仍保存修改", False):
         config["users"][index] = candidate
         save_config(config)
@@ -13927,6 +14075,7 @@ def edit_settings(config):
     config["stop_wait_seconds"] = prompt_int(
         "停止实例后等待确认时间（秒）", config.get("stop_wait_seconds", 45), 0, 600
     )
+    config["stop_mode"] = choose_stop_mode(config, config, allow_inherit=False)
     current_watchdog = config.get("watchdog", {})
     if not isinstance(current_watchdog, dict):
         current_watchdog = {}

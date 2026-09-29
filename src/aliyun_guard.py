@@ -100,6 +100,7 @@ DEFAULT_CONFIG = {
     "start_wait_seconds": 90,
     "stop_wait_seconds": 45,
     "start_poll_seconds": 5,
+    "stop_mode": "KeepCharging",
     "watchdog": {
         "enabled": True,
         "timeout_seconds": 600,
@@ -134,6 +135,10 @@ _JSON_WRITE_LOCK = threading.RLock()
 _INSTANCE_LOG_LOCK = threading.Lock()
 MAX_ECS_STATUS_BATCH_CALLS = 32
 _TELEGRAM_LOCAL = threading.local()
+
+# 阿里云 ECS StopInstance 的 StoppedMode 参数：KeepCharging=普通停机模式，StopCharging=节省停机模式。
+STOP_MODES = ("KeepCharging", "StopCharging")
+DEFAULT_STOP_MODE = "KeepCharging"
 
 # 阿里云 SDK 对可重试的 HTTP 错误可能进行额外重试。检测服务是周期任务，
 # 请求失败时应尽快结束本轮并保留下一轮重试机会，不能让一次网络故障阻塞数十分钟。
@@ -411,6 +416,11 @@ def validate_config(config):
     mode = config.get("notification_mode")
     if mode not in ("always", "events", "errors"):
         raise GuardError("notification_mode 必须是 always、events 或 errors")
+    if "stop_mode" in config:
+        try:
+            normalize_stop_mode(config["stop_mode"])
+        except GuardError as exc:
+            raise GuardError("全局停机模式无效: {}".format(exc))
     watchdog = config.get("watchdog", {})
     if not isinstance(watchdog, dict):
         raise GuardError("watchdog 必须是对象")
@@ -481,6 +491,11 @@ def validate_config(config):
             for field in ("endpoint", "region", "currency_code", "currency_symbol"):
                 if not str(billing.get(field, "")).strip():
                     raise GuardError("第 {} 个实例的账单配置缺少 {}".format(index, field))
+        if "stop_mode" in user:
+            try:
+                normalize_stop_mode(user["stop_mode"])
+            except GuardError as exc:
+                raise GuardError("第 {} 个实例的停机模式无效: {}".format(index, exc))
 
 
 def validate_telegram_config(telegram):
@@ -907,6 +922,25 @@ def normalize_schedule_time(value, field_name="时间"):
     if hour > 23 or minute > 59:
         raise GuardError("{}超出有效范围".format(field_name))
     return "{:02d}:{:02d}".format(hour, minute)
+
+
+def normalize_stop_mode(value):
+    """Normalize and validate one stop mode value."""
+    mode = str(value or "").strip()
+    if mode and mode not in STOP_MODES:
+        raise GuardError(
+            "停机模式必须为 KeepCharging（普通停机）或 StopCharging（节省停机）"
+        )
+    return mode or DEFAULT_STOP_MODE
+
+
+def get_stop_mode(user, config=None):
+    """Return the effective stop mode for a user: instance override, then global default."""
+    if isinstance(user, dict) and str(user.get("stop_mode", "") or "").strip():
+        return normalize_stop_mode(user.get("stop_mode"))
+    if isinstance(config, dict) and str(config.get("stop_mode", "") or "").strip():
+        return normalize_stop_mode(config.get("stop_mode"))
+    return DEFAULT_STOP_MODE
 
 
 def get_schedule_config(user):
@@ -1442,12 +1476,15 @@ def start_instance(user):
     make_client(user).do_action_with_exception(request)
 
 
-def stop_instance(user):
+def stop_instance(user, stop_mode=None):
     require_sdk()
     request = StopInstanceRequest()
     request.set_protocol_type("https")
     request.set_accept_format("json")
     request.set_InstanceId(str(user["instance_id"]).strip())
+    effective_mode = normalize_stop_mode(stop_mode)
+    if effective_mode != DEFAULT_STOP_MODE:
+        request.set_StoppedMode(effective_mode)
     configure_aliyun_request(request)
     make_client(user).do_action_with_exception(request)
 
@@ -2056,7 +2093,7 @@ def check_one(
                 result["message"] = "当前处于计划关机时段，但自动操作未启用"
             else:
                 try:
-                    stop_instance(user)
+                    stop_instance(user, get_stop_mode(user, config))
                     result["action_performed"] = True
                     LOGGER.info("[%s] 已提交定时关机请求", name)
                     latest, poll_error = wait_for_status(
@@ -2179,7 +2216,7 @@ def check_one(
                 result["message"] = "流量达到阈值，但自动操作未启用"
             else:
                 try:
-                    stop_instance(user)
+                    stop_instance(user, get_stop_mode(user, config))
                     result["action_performed"] = True
                     LOGGER.warning("[%s] 流量达到阈值，已提交停止请求", name)
                     latest, poll_error = wait_for_status(user, "Stopped", stop_wait_seconds, poll_seconds)
