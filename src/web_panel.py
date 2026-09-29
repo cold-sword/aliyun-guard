@@ -30,7 +30,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.15"
+APP_VERSION = "1.6.22"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -54,9 +54,10 @@ DEFAULT_WEB_CONFIG = {
 
 
 class WebPanelError(RuntimeError):
-    def __init__(self, message, status=400):
+    def __init__(self, message, status=400, details=None):
         super().__init__(message)
         self.status = status
+        self.details = details
 
 
 def hash_password(password, iterations=PASSWORD_ITERATIONS):
@@ -270,6 +271,7 @@ def dashboard_payload(guard, config=None, state=None, job=None):
                 "instance_log_enabled": bool(
                     user.get("instance_log_enabled", False)
                 ),
+                "stop_mode": guard.get_stop_mode(user, config),
                 "traffic_gb": traffic,
                 "traffic_limit_gb": limit,
                 "traffic_percent": percent,
@@ -563,10 +565,17 @@ def control_instance(
                 if traffic >= limit:
                     if not allow_threshold_override:
                         raise WebPanelError(
-                            "当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值，拒绝开机".format(
+                            "当前 CDT 流量 {:.2f} GB 已达到 {:.2f} GB 阈值，请二次确认后强制开机".format(
                                 traffic, limit
                             ),
                             409,
+                            details={
+                                "reason": "threshold",
+                                "traffic_gb": round(traffic, 2),
+                                "limit_gb": limit,
+                                "instance_id": str(user.get("instance_id", "")),
+                                "name": name,
+                            },
                         )
                     threshold_overridden = True
                 if threshold_overridden and pause_on_threshold_override:
@@ -592,7 +601,7 @@ def control_instance(
                             guard, user, False
                         )
             elif before != "Stopped":
-                guard.stop_instance(user)
+                guard.stop_instance(user, guard.get_stop_mode(user, config))
                 performed = True
                 monitor_paused = _set_instance_monitor_state(
                     guard, user, True
@@ -1080,7 +1089,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 payload["details"] = exc.details
             self._json(payload, exc.status)
         except WebPanelError as exc:
-            self._json({"ok": False, "error": str(exc)}, exc.status)
+            payload = {"ok": False, "error": str(exc)}
+            if exc.details is not None:
+                payload["details"] = exc.details
+            self._json(payload, exc.status)
         except Exception as exc:
             self._json({"ok": False, "error": "服务器内部错误"}, 500)
             self.server.guard.LOGGER.exception("Web GET error: %s", exc)
@@ -1300,7 +1312,14 @@ class PanelHandler(BaseHTTPRequestHandler):
                     self._json({"ok": True, "result": result})
                     return
                 if parts[3] == "power":
-                    result = control_instance(self.server.guard, index, data.get("action"))
+                    force = bool(data.get("force", False))
+                    result = control_instance(
+                        self.server.guard,
+                        index,
+                        data.get("action"),
+                        allow_threshold_override=force,
+                        pause_on_threshold_override=force,
+                    )
                     self._json({"ok": True, "result": result})
                     return
             raise WebPanelError("接口不存在", 404)
@@ -1310,7 +1329,10 @@ class PanelHandler(BaseHTTPRequestHandler):
                 payload["details"] = exc.details
             self._json(payload, exc.status)
         except WebPanelError as exc:
-            self._json({"ok": False, "error": str(exc)}, exc.status)
+            payload = {"ok": False, "error": str(exc)}
+            if exc.details is not None:
+                payload["details"] = exc.details
+            self._json(payload, exc.status)
         except Exception as exc:
             self._json({"ok": False, "error": "服务器内部错误"}, 500)
             self.server.guard.LOGGER.exception("Web POST error: %s", exc)

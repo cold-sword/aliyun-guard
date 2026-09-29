@@ -155,8 +155,10 @@ def _billing_payload(guard, user):
     }
 
 
-def _instance_payload(guard, user, index):
+def _instance_payload(guard, user, index, config=None):
     schedule = guard.get_schedule_config(user)
+    if config is None:
+        config = guard.load_config()
     return {
         "index": index,
         "name": str(user.get("name", "")),
@@ -168,6 +170,8 @@ def _instance_payload(guard, user, index):
         "actions_enabled": bool(user.get("actions_enabled", True)),
         "instance_log_enabled": bool(user.get("instance_log_enabled", False)),
         "paused": bool(user.get("paused", False)),
+        "stop_mode": guard.get_stop_mode(user, config),
+        "stop_mode_inherited": not str(user.get("stop_mode", "") or "").strip(),
         "billing": _billing_payload(guard, user),
         "schedule": {
             "enabled": schedule["enabled"],
@@ -223,7 +227,7 @@ def management_payload(guard, backend="unknown"):
     web = raw_web if isinstance(raw_web, dict) else {}
     return {
         "instances": [
-            _instance_payload(guard, user, index)
+            _instance_payload(guard, user, index, config)
             for index, user in enumerate(config.get("users", []))
         ],
         "telegram": telegram_payload(guard, config.get("telegram", {})),
@@ -236,6 +240,12 @@ def management_payload(guard, backend="unknown"):
             "start_wait_seconds": int(config.get("start_wait_seconds", 90)),
             "stop_wait_seconds": int(config.get("stop_wait_seconds", 45)),
             "start_poll_seconds": int(config.get("start_poll_seconds", 5)),
+            "stop_mode": str(
+                config.get(
+                    "stop_mode",
+                    guard.DEFAULT_STOP_MODE,
+                )
+            ),
             "watchdog": {
                 "enabled": bool(config.get("watchdog", {}).get("enabled", True)),
                 "timeout_seconds": int(
@@ -735,6 +745,16 @@ def build_instance_candidate(guard, data, existing=None):
         bool(existing.get("instance_log_enabled", False)),
     )
     candidate["paused"] = bool(existing.get("paused", False))
+    if "stop_mode" in data:
+        raw_stop_mode = str(data.get("stop_mode", "") or "").strip()
+        if raw_stop_mode:
+            candidate["stop_mode"] = guard.normalize_stop_mode(raw_stop_mode)
+        else:
+            candidate.pop("stop_mode", None)
+    elif "stop_mode" in existing:
+        candidate["stop_mode"] = guard.normalize_stop_mode(
+            existing.get("stop_mode")
+        )
     candidate["billing"] = _normalize_billing(
         guard, data.get("billing"), existing
     )
@@ -878,6 +898,8 @@ def update_global_settings(guard, data):
     config["start_poll_seconds"] = _integer(
         data, "start_poll_seconds", config.get("start_poll_seconds", 5), 1, 60
     )
+    if "stop_mode" in data:
+        config["stop_mode"] = guard.normalize_stop_mode(data.get("stop_mode"))
     watchdog_data = data.get("watchdog", {})
     if not isinstance(watchdog_data, dict):
         raise ManagementError("watchdog 必须是对象")

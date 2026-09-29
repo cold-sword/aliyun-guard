@@ -500,7 +500,7 @@
     .menu-button:disabled { opacity: .5; cursor: not-allowed; }
 
     .card-body { padding: 16px 18px 12px; display: flex; flex-direction: column; flex: 1 0 auto; }
-    .metric-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 12px; }
+    .metric-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 12px; }
     .metric { min-width: 0; background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--radius-s); padding: 9px 11px; }
     .metric-label { color: var(--faint); font-size: 11px; font-weight: 600; }
     .metric-value { margin-top: 3px; font-weight: 700; font-size: 13.5px; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
@@ -773,7 +773,7 @@
     .dialog-head h2 { margin: 0; font-size: 16px; font-weight: 700; letter-spacing: -.01em; }
     .dialog-body { padding: 20px 18px; max-height: min(66vh, 620px); overflow: auto; }
     .dialog-actions { padding: 13px 18px; border-top: 1px solid var(--line); display: flex; justify-content: flex-end; gap: 8px; background: var(--surface-2); border-radius: 0 0 var(--radius-l) var(--radius-l); }
-    .confirm-message { margin: 0; color: var(--ink-soft); font-size: 13.5px; line-height: 1.6; }
+    .confirm-message { margin: 0; color: var(--ink-soft); font-size: 13.5px; line-height: 1.6; white-space: pre-line; }
 
     /* ---------- Toasts ---------- */
     .toasts {
@@ -1044,6 +1044,7 @@
               <label class="check-row"><input id="notifyOnStart" type="checkbox">服务启动时发送通知</label>
               <div class="field"><label for="startWait">开机确认等待（秒）</label><input id="startWait" type="number" min="0" max="600" required></div>
               <div class="field"><label for="stopWait">关机确认等待（秒）</label><input id="stopWait" type="number" min="0" max="600" required></div>
+              <div class="field"><label for="globalStopMode">默认停机模式</label><select id="globalStopMode"><option value="KeepCharging">普通停机（继续计费）</option><option value="StopCharging">节省停机（回收计算资源）</option></select></div>
               <div class="field"><label for="pollSeconds">状态轮询间隔（秒）</label><input id="pollSeconds" type="number" min="1" max="60" required></div>
               <label class="check-row wide"><input id="watchdogEnabled" type="checkbox">启用监控失联看门狗</label>
               <div class="field"><label for="watchdogTimeout">心跳超时（秒）</label><input id="watchdogTimeout" type="number" min="120" max="86400" required></div>
@@ -1174,6 +1175,7 @@
           <div class="field"><label for="instanceAk">AccessKey ID</label><input id="instanceAk" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
           <div class="field"><label for="instanceSk">AccessKey Secret</label><input id="instanceSk" type="password" autocomplete="off" placeholder="已保存，留空不修改"></div>
           <div class="field"><label for="trafficLimit">CDT 关机阈值（GB）</label><input id="trafficLimit" type="number" min="0.01" step="0.01" required></div>
+          <div class="field"><label for="instanceStopMode">停机模式</label><select id="instanceStopMode"><option value="">跟随全局默认</option><option value="KeepCharging">普通停机（继续计费）</option><option value="StopCharging">节省停机（回收计算资源）</option></select></div>
           <label class="check-row"><input id="actionsEnabled" type="checkbox">允许自动开机与关机</label>
           <label class="check-row"><input id="instanceLogEnabled" type="checkbox">记录该实例独立日志</label>
           <label class="check-row"><input id="billingEnabled" type="checkbox">查询本月实例账单</label>
@@ -1439,6 +1441,7 @@
             <div class="metric"><div class="metric-label">CDT 流量</div><div class="metric-value">${fmtNum(item.traffic_gb)} GB</div></div>
             <div class="metric"><div class="metric-label">关机阈值</div><div class="metric-value">${fmtNum(item.traffic_limit_gb)} GB</div></div>
             <div class="metric"${billTitle}><div class="metric-label">本月账单</div><div class="metric-value">${bill}</div></div>
+            <div class="metric" title="${item.stop_mode === "StopCharging" ? "节省停机：停止后回收计算资源，重启可能因库存失败，公网 IP 可能变化" : "普通停机：停止后继续计费，保留全部资源"}"><div class="metric-label">停机模式</div><div class="metric-value">${item.stop_mode === "StopCharging" ? "节省停机" : "普通停机"}</div></div>
             <div class="metric"><div class="metric-label">每日计划</div><div class="metric-value">${sched}</div></div>
           </div>
           <div class="traffic-row"><span>本月流量使用率</span><strong>${item.traffic_percent === null ? "--" : fmtNum(item.traffic_percent, 1) + "%"}</strong></div>
@@ -1526,6 +1529,7 @@
       $("notifyOnStart").checked = settings.notify_on_daemon_start;
       $("startWait").value = settings.start_wait_seconds;
       $("stopWait").value = settings.stop_wait_seconds;
+      $("globalStopMode").value = settings.stop_mode;
       $("pollSeconds").value = settings.start_poll_seconds;
       $("watchdogEnabled").checked = settings.watchdog.enabled;
       $("watchdogTimeout").value = settings.watchdog.timeout_seconds;
@@ -1738,6 +1742,7 @@
       $("instanceAk").placeholder = existing?.access_key_configured ? "已保存，留空不修改" : "请输入 AccessKey ID";
       $("instanceSk").placeholder = existing?.secret_key_configured ? "已保存，留空不修改" : "请输入 AccessKey Secret";
       $("trafficLimit").value = existing?.traffic_limit_gb ?? 180;
+      $("instanceStopMode").value = existing?.stop_mode_inherited ? "" : (existing?.stop_mode || "");
       $("actionsEnabled").checked = existing?.actions_enabled ?? true;
       $("instanceLogEnabled").checked = existing?.instance_log_enabled ?? false;
       $("billingEnabled").checked = existing?.billing.enabled ?? true;
@@ -1762,6 +1767,7 @@
         region: $("instanceRegion").value.trim(),
         instance_id: $("instanceId").value.trim(),
         traffic_limit_gb: Number($("trafficLimit").value),
+        stop_mode: $("instanceStopMode").value,
         actions_enabled: $("actionsEnabled").checked,
         instance_log_enabled: $("instanceLogEnabled").checked,
         billing: {
@@ -1954,7 +1960,28 @@
         const confirmed = await confirmAction({ title: action === "start" ? "开机实例" : "关机实例", message: `确认${action === "start" ? "开机" : "关机"} ${item.name}？`, confirmText: action === "start" ? "开机" : "关机", tone: action === "start" ? "primary" : "warning" });
         if (!confirmed) return;
         button.disabled = true;
-        try { const data = await api(`/api/instances/${index}/power`, { method: "POST", body: { action } }); toast(data.result.notification_error ? `操作成功，Telegram 通知失败：${data.result.notification_error}` : "实例操作已完成", Boolean(data.result.notification_error)); await loadDashboard(); } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
+        try {
+          try {
+            const data = await api(`/api/instances/${index}/power`, { method: "POST", body: { action } });
+            toast(data.result.notification_error ? `操作成功，Telegram 通知失败：${data.result.notification_error}` : "实例操作已完成", Boolean(data.result.notification_error));
+            await loadDashboard();
+          } catch (error) {
+            if (action === "start" && error.details && error.details.reason === "threshold") {
+              const force = await confirmAction({
+                title: "流量已到关机阈值",
+                message: `${error.details.name} 当前 CDT 流量 ${fmtNum(error.details.traffic_gb)} GB 已达到 ${fmtNum(error.details.limit_gb)} GB 阈值。\n确认强制开机？该实例监控将自动暂停，避免下一轮再次被自动关机。`,
+                confirmText: "强制开机",
+                tone: "warning",
+              });
+              if (!force) return;
+              const data = await api(`/api/instances/${index}/power`, { method: "POST", body: { action, force: true } });
+              toast(data.result.notification_error ? `强制开机成功，Telegram 通知失败：${data.result.notification_error}` : "已强制开机并暂停该实例监控", Boolean(data.result.notification_error));
+              await loadDashboard();
+            } else {
+              toast(error.message, true);
+            }
+          }
+        } catch (error) { toast(error.message, true); } finally { button.disabled = false; }
       }
     });
 
@@ -2024,6 +2051,7 @@
           start_wait_seconds: Number($("startWait").value),
           stop_wait_seconds: Number($("stopWait").value),
           start_poll_seconds: Number($("pollSeconds").value),
+          stop_mode: $("globalStopMode").value,
           watchdog: { enabled: $("watchdogEnabled").checked, timeout_seconds: Number($("watchdogTimeout").value), failure_threshold: Number($("watchdogFailures").value) },
         } });
         toast("全局设置已保存");
