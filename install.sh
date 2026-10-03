@@ -5755,7 +5755,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.22"
+APP_VERSION = "1.6.23"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -8088,7 +8088,7 @@ __AG_WEB_PY_EOF__
       position: fixed;
       right: 18px;
       bottom: 18px;
-      z-index: 90;
+      z-index: 300;
       display: grid;
       gap: 10px;
       width: min(400px, calc(100vw - 36px));
@@ -12819,8 +12819,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.22"
-LOCAL_RELEASE_ID = "ae462cb2a800f0164e4a536e75cb1dfb76a7d32ef9e56d6cf4bedc75e67a31a1"
+APP_VERSION = "1.6.23"
+LOCAL_RELEASE_ID = "9448367e012610fc8147b5b01196b6b08a818efc153a93e8b566c7bdef377169"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
