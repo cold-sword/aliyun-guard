@@ -5755,7 +5755,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.23"
+APP_VERSION = "1.6.24"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -10774,20 +10774,38 @@ def query_instance_bill(user):
     billing = get_billing_config(user)
     if not billing.get("enabled", True):
         return None, None
-    request = CommonRequest()
-    request.set_protocol_type("https")
-    request.set_accept_format("json")
-    request.set_method("POST")
-    request.set_domain(str(billing["endpoint"]).strip())
-    request.set_version("2017-12-14")
-    request.set_action_name("DescribeInstanceBill")
-    configure_aliyun_request(request)
-    request.add_query_param("BillingCycle", dt.datetime.now().strftime("%Y-%m"))
-    request.add_query_param("InstanceID", str(user["instance_id"]).strip())
-    request.add_query_param("ProductCode", "ecs")
-    request.add_query_param("PageNum", "1")
-    request.add_query_param("PageSize", "300")
-    response = make_client(user, str(billing["region"]).strip()).do_action_with_exception(request)
+    response = None
+    for attempt in range(1, CDT_REQUEST_ATTEMPTS + 1):
+        request = CommonRequest()
+        request.set_protocol_type("https")
+        request.set_accept_format("json")
+        request.set_method("POST")
+        request.set_domain(str(billing["endpoint"]).strip())
+        request.set_version("2017-12-14")
+        request.set_action_name("DescribeInstanceBill")
+        configure_aliyun_request(request)
+        request.add_query_param("BillingCycle", dt.datetime.now().strftime("%Y-%m"))
+        request.add_query_param("InstanceID", str(user["instance_id"]).strip())
+        request.add_query_param("ProductCode", "ecs")
+        request.add_query_param("PageNum", "1")
+        request.add_query_param("PageSize", "300")
+        try:
+            response = make_client(
+                user, str(billing["region"]).strip()
+            ).do_action_with_exception(request)
+            break
+        except Exception as exc:
+            if attempt >= CDT_REQUEST_ATTEMPTS or not is_retryable_aliyun_network_error(exc):
+                raise
+            delay = CDT_RETRY_BACKOFF_SECONDS[attempt - 1]
+            LOGGER.warning(
+                "[BSS] 账单查询网络失败，将在 %s 秒后重试（第 %s/%s 次）: %s",
+                delay,
+                attempt + 1,
+                CDT_REQUEST_ATTEMPTS,
+                compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
+            )
+            time.sleep(delay)
     data = json.loads(response.decode("utf-8"))
     if data.get("Success") is False:
         raise GuardError(
@@ -11799,7 +11817,8 @@ def check_one(
                 result["bill_error"] = "BSS 账单刷新失败，继续使用缓存: {}".format(
                     compact_error(cached_bill_error, secrets=user_secrets)
                 )
-                result["errors"].append(result["bill_error"])
+                if result["level"] == "ok":
+                    result["level"] = "warning"
                 LOGGER.warning("[%s] %s", name, result["bill_error"])
         except Exception as exc:
             result["bill_error"] = "BSS 账单查询失败: {}".format(
@@ -12819,8 +12838,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.23"
-LOCAL_RELEASE_ID = "9448367e012610fc8147b5b01196b6b08a818efc153a93e8b566c7bdef377169"
+APP_VERSION = "1.6.24"
+LOCAL_RELEASE_ID = "fa2bd29da999cb824dec268c2f3f8b5331050e16cb7fc1151bf488208418f9c3"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"

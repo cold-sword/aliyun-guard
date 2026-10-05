@@ -2,7 +2,7 @@
 
 ![Linux](https://img.shields.io/badge/OS-Linux-1793d1?logo=linux&logoColor=white)
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776ab?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-v1.6.23-2ea44f)
+![Version](https://img.shields.io/badge/version-v1.6.24-2ea44f)
 ![Alibaba Cloud](https://img.shields.io/badge/Alibaba%20Cloud-China%20%26%20International-ff6a00)
 ![Init](https://img.shields.io/badge/Init-systemd%20%7C%20OpenRC%20%7C%20cron-4c566a)
 ![Telegram](https://img.shields.io/badge/Telegram-Notify%20%26%20Control-26a5e4?logo=telegram&logoColor=white)
@@ -186,7 +186,7 @@ flowchart TD
 21) 重置网页登录密码
 ```
 
-面板标题始终显示当前版本号，例如 `阿里云保活与通知 v1.6.23 - 管理面板`。发现更新时，标题下方和第 16 项会显示黄色的新版本提示；启动检查超时或 GitHub 暂时不可用不会阻塞其他管理操作，也不会自动安装更新。设置 `NO_COLOR=1` 或将输出重定向到文件时，提示会自动退回纯文本。
+面板标题始终显示当前版本号，例如 `阿里云保活与通知 v1.6.24 - 管理面板`。发现更新时，标题下方和第 16 项会显示黄色的新版本提示；启动检查超时或 GitHub 暂时不可用不会阻塞其他管理操作，也不会自动安装更新。设置 `NO_COLOR=1` 或将输出重定向到文件时，提示会自动退回纯文本。
 
 ## Telegram Bot 控制
 
@@ -731,7 +731,7 @@ Docker 部署继续由 Compose 的 `restart: unless-stopped` 负责进程退出�
 
 ## 从 GitHub 更新
 
-例如当前发布版本为 `v1.6.23`。若网页更新失败，先在服务器终端执行 `sudo /opt/aliyun-guard/control.sh update` 查看具体错误；Docker 部署请在 Compose 目录执行 `docker compose up -d --build`。
+例如当前发布版本为 `v1.6.24`。若网页更新失败，先在服务器终端执行 `sudo /opt/aliyun-guard/control.sh update` 查看具体错误；Docker 部署请在 Compose 目录执行 `docker compose up -d --build`。
 
 ```sh
 aliyun-guard update
