@@ -1040,20 +1040,38 @@ def query_instance_bill(user):
     billing = get_billing_config(user)
     if not billing.get("enabled", True):
         return None, None
-    request = CommonRequest()
-    request.set_protocol_type("https")
-    request.set_accept_format("json")
-    request.set_method("POST")
-    request.set_domain(str(billing["endpoint"]).strip())
-    request.set_version("2017-12-14")
-    request.set_action_name("DescribeInstanceBill")
-    configure_aliyun_request(request)
-    request.add_query_param("BillingCycle", dt.datetime.now().strftime("%Y-%m"))
-    request.add_query_param("InstanceID", str(user["instance_id"]).strip())
-    request.add_query_param("ProductCode", "ecs")
-    request.add_query_param("PageNum", "1")
-    request.add_query_param("PageSize", "300")
-    response = make_client(user, str(billing["region"]).strip()).do_action_with_exception(request)
+    response = None
+    for attempt in range(1, CDT_REQUEST_ATTEMPTS + 1):
+        request = CommonRequest()
+        request.set_protocol_type("https")
+        request.set_accept_format("json")
+        request.set_method("POST")
+        request.set_domain(str(billing["endpoint"]).strip())
+        request.set_version("2017-12-14")
+        request.set_action_name("DescribeInstanceBill")
+        configure_aliyun_request(request)
+        request.add_query_param("BillingCycle", dt.datetime.now().strftime("%Y-%m"))
+        request.add_query_param("InstanceID", str(user["instance_id"]).strip())
+        request.add_query_param("ProductCode", "ecs")
+        request.add_query_param("PageNum", "1")
+        request.add_query_param("PageSize", "300")
+        try:
+            response = make_client(
+                user, str(billing["region"]).strip()
+            ).do_action_with_exception(request)
+            break
+        except Exception as exc:
+            if attempt >= CDT_REQUEST_ATTEMPTS or not is_retryable_aliyun_network_error(exc):
+                raise
+            delay = CDT_RETRY_BACKOFF_SECONDS[attempt - 1]
+            LOGGER.warning(
+                "[BSS] 账单查询网络失败，将在 %s 秒后重试（第 %s/%s 次）: %s",
+                delay,
+                attempt + 1,
+                CDT_REQUEST_ATTEMPTS,
+                compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
+            )
+            time.sleep(delay)
     data = json.loads(response.decode("utf-8"))
     if data.get("Success") is False:
         raise GuardError(
@@ -2065,7 +2083,8 @@ def check_one(
                 result["bill_error"] = "BSS 账单刷新失败，继续使用缓存: {}".format(
                     compact_error(cached_bill_error, secrets=user_secrets)
                 )
-                result["errors"].append(result["bill_error"])
+                if result["level"] == "ok":
+                    result["level"] = "warning"
                 LOGGER.warning("[%s] %s", name, result["bill_error"])
         except Exception as exc:
             result["bill_error"] = "BSS 账单查询失败: {}".format(
