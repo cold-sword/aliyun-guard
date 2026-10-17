@@ -1249,14 +1249,38 @@ def query_cdt_traffic_gb_for_cycle(user, cycle_cache=None):
     return traffic_gb
 
 
+def retry_aliyun_call(user, label, func):
+    """Run one Aliyun API call, retrying transient transport failures."""
+    for attempt in range(1, CDT_REQUEST_ATTEMPTS + 1):
+        try:
+            return func()
+        except Exception as exc:
+            if attempt >= CDT_REQUEST_ATTEMPTS or not is_retryable_aliyun_network_error(exc):
+                raise
+            delay = CDT_RETRY_BACKOFF_SECONDS[attempt - 1]
+            LOGGER.warning(
+                "[%s] 网络失败，将在 %s 秒后重试（第 %s/%s 次）: %s",
+                label,
+                delay,
+                attempt + 1,
+                CDT_REQUEST_ATTEMPTS,
+                compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
+            )
+            time.sleep(delay)
+
+
 def query_instance_status(user):
     require_sdk()
-    request = DescribeInstancesRequest()
-    request.set_protocol_type("https")
-    request.set_accept_format("json")
-    request.set_InstanceIds(json.dumps([str(user["instance_id"]).strip()]))
-    configure_aliyun_request(request)
-    response = make_client(user).do_action_with_exception(request)
+
+    def _request():
+        request = DescribeInstancesRequest()
+        request.set_protocol_type("https")
+        request.set_accept_format("json")
+        request.set_InstanceIds(json.dumps([str(user["instance_id"]).strip()]))
+        configure_aliyun_request(request)
+        return make_client(user).do_action_with_exception(request)
+
+    response = retry_aliyun_call(user, "ECS", _request)
     data = json.loads(response.decode("utf-8"))
     instances = data.get("Instances", {}).get("Instance", [])
     if not instances:
@@ -1285,15 +1309,19 @@ def query_instance_statuses(users):
     if not users:
         return {}
     require_sdk()
-    request = DescribeInstancesRequest()
-    request.set_protocol_type("https")
-    request.set_accept_format("json")
-    request.set_InstanceIds(
-        json.dumps([str(user.get("instance_id", "") or "").strip() for user in users])
-    )
-    request.set_PageSize(min(100, len(users)))
-    configure_aliyun_request(request)
-    response = make_client(users[0]).do_action_with_exception(request)
+
+    def _request():
+        request = DescribeInstancesRequest()
+        request.set_protocol_type("https")
+        request.set_accept_format("json")
+        request.set_InstanceIds(
+            json.dumps([str(user.get("instance_id", "") or "").strip() for user in users])
+        )
+        request.set_PageSize(min(100, len(users)))
+        configure_aliyun_request(request)
+        return make_client(users[0]).do_action_with_exception(request)
+
+    response = retry_aliyun_call(users[0], "ECS", _request)
     data = json.loads(response.decode("utf-8"))
     instances = data.get("Instances", {}).get("Instance", [])
     if not isinstance(instances, list):
