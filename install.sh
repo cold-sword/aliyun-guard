@@ -5755,7 +5755,7 @@ except ImportError:  # pragma: no cover - cron supervision runs on Linux
     fcntl = None
 
 
-APP_VERSION = "1.6.24"
+APP_VERSION = "1.6.25"
 APP_DIR = Path(os.environ.get("ALIYUN_GUARD_HOME", Path(__file__).resolve().parent))
 HTML_FILE = APP_DIR / "web_panel.html"
 PID_FILE = APP_DIR / "web-panel.pid"
@@ -10983,14 +10983,38 @@ def query_cdt_traffic_gb_for_cycle(user, cycle_cache=None):
     return traffic_gb
 
 
+def retry_aliyun_call(user, label, func):
+    """Run one Aliyun API call, retrying transient transport failures."""
+    for attempt in range(1, CDT_REQUEST_ATTEMPTS + 1):
+        try:
+            return func()
+        except Exception as exc:
+            if attempt >= CDT_REQUEST_ATTEMPTS or not is_retryable_aliyun_network_error(exc):
+                raise
+            delay = CDT_RETRY_BACKOFF_SECONDS[attempt - 1]
+            LOGGER.warning(
+                "[%s] 网络失败，将在 %s 秒后重试（第 %s/%s 次）: %s",
+                label,
+                delay,
+                attempt + 1,
+                CDT_REQUEST_ATTEMPTS,
+                compact_error(exc, secrets=(user.get("ak"), user.get("sk"))),
+            )
+            time.sleep(delay)
+
+
 def query_instance_status(user):
     require_sdk()
-    request = DescribeInstancesRequest()
-    request.set_protocol_type("https")
-    request.set_accept_format("json")
-    request.set_InstanceIds(json.dumps([str(user["instance_id"]).strip()]))
-    configure_aliyun_request(request)
-    response = make_client(user).do_action_with_exception(request)
+
+    def _request():
+        request = DescribeInstancesRequest()
+        request.set_protocol_type("https")
+        request.set_accept_format("json")
+        request.set_InstanceIds(json.dumps([str(user["instance_id"]).strip()]))
+        configure_aliyun_request(request)
+        return make_client(user).do_action_with_exception(request)
+
+    response = retry_aliyun_call(user, "ECS", _request)
     data = json.loads(response.decode("utf-8"))
     instances = data.get("Instances", {}).get("Instance", [])
     if not instances:
@@ -11019,15 +11043,19 @@ def query_instance_statuses(users):
     if not users:
         return {}
     require_sdk()
-    request = DescribeInstancesRequest()
-    request.set_protocol_type("https")
-    request.set_accept_format("json")
-    request.set_InstanceIds(
-        json.dumps([str(user.get("instance_id", "") or "").strip() for user in users])
-    )
-    request.set_PageSize(min(100, len(users)))
-    configure_aliyun_request(request)
-    response = make_client(users[0]).do_action_with_exception(request)
+
+    def _request():
+        request = DescribeInstancesRequest()
+        request.set_protocol_type("https")
+        request.set_accept_format("json")
+        request.set_InstanceIds(
+            json.dumps([str(user.get("instance_id", "") or "").strip() for user in users])
+        )
+        request.set_PageSize(min(100, len(users)))
+        configure_aliyun_request(request)
+        return make_client(users[0]).do_action_with_exception(request)
+
+    response = retry_aliyun_call(users[0], "ECS", _request)
     data = json.loads(response.decode("utf-8"))
     instances = data.get("Instances", {}).get("Instance", [])
     if not isinstance(instances, list):
@@ -12838,8 +12866,8 @@ UPDATE_REPOSITORY = "Felix666-ship-It/aliyun-guard"
 UPDATE_CUSTOM_BASE_URL = os.environ.get("ALIYUN_GUARD_UPDATE_BASE", "").rstrip("/")
 UPDATE_RELEASES_URL = "https://github.com/{}/releases".format(UPDATE_REPOSITORY)
 UPDATE_BASE_URL = UPDATE_CUSTOM_BASE_URL or UPDATE_RELEASES_URL + "/latest/download"
-APP_VERSION = "1.6.24"
-LOCAL_RELEASE_ID = "fa2bd29da999cb824dec268c2f3f8b5331050e16cb7fc1151bf488208418f9c3"
+APP_VERSION = "1.6.25"
+LOCAL_RELEASE_ID = "0fcf8b872c5bfe8fe76a90dce823f519202af1b18a0158d10f27cb5ef8ba6416"
 UPDATE_MANIFEST_NAME = "version.json"
 UPDATE_CHECK_TIMEOUT_SECONDS = 5
 ANSI_YELLOW = "\033[33m"
